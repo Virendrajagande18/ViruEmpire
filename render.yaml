@@ -3,9 +3,13 @@
 # Render reads this file and deploys the Docker image automatically.
 #
 # REQUIRED env vars (set in the Render dashboard, never in this file):
-#   CEO_USERNAME  — the CEO login username
-#   CEO_PASSWORD  — the CEO login password (the panel stores only its salted hash)
+#   CEO_USERNAME       — the CEO login username
+#   CEO_PASSWORD       — the CEO login password (the panel stores only its salted hash)
+#   TURSO_DATABASE_URL — libSQL URL of the Turso database (e.g. libsql://viru-empire-panel-....turso.io)
+#   TURSO_AUTH_TOKEN   — auth token for that Turso database
 # The server creates the CEO account from these on first run if none exists.
+# The server refuses to start without the Turso variables — there is no
+# local-file fallback, because a local file loses data when the server sleeps.
 services:
   - type: web
     name: viru-empire-ceo-panel
@@ -16,4 +20,8 @@ services:
       - key: CEO_USERNAME
         sync: false
       - key: CEO_PASSWORD
+        sync: false
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
         sync: false

@@ -11,10 +11,10 @@ COPY server.ts ./
 COPY src ./src
 COPY client-dist ./client-dist
 
-# SQLite data directory (Render free tier: survives sleeps, wiped on redeploy —
-# keep Export / Backup copies safe).
-RUN mkdir -p /app/data
+# No local data directory: the panel stores everything in Turso (a hosted
+# database), because Render's free tier wipes the server's own files
+# whenever it sleeps or redeploys. TURSO_DATABASE_URL / TURSO_AUTH_TOKEN
+# are set in the Render dashboard, never in this file.
 EXPOSE 3000
 ENV PORT=3000
-ENV DB_PATH=/app/data/viru-empire.db
 CMD ["bun", "./server.ts"]
