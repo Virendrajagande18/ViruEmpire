@@ -1,0 +1,19 @@
+# Render deploy config — Viru Empire CEO Panel (free tier).
+# Push this folder to GitHub, then on render.com: New + -> Blueprint -> pick the repo.
+# Render reads this file and deploys the Docker image automatically.
+#
+# REQUIRED env vars (set in the Render dashboard, never in this file):
+#   CEO_USERNAME  — the CEO login username
+#   CEO_PASSWORD  — the CEO login password (the panel stores only its salted hash)
+# The server creates the CEO account from these on first run if none exists.
+services:
+  - type: web
+    name: viru-empire-ceo-panel
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: CEO_USERNAME
+        sync: false
+      - key: CEO_PASSWORD
+        sync: false

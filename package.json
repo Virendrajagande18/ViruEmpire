@@ -1,0 +1,13 @@
+{
+  "name": "viru-empire-ceo-panel-standalone",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:client": "bun ./build-client.mjs",
+    "start": "bun ./server.ts"
+  },
+  "dependencies": {
+    "drizzle-orm": "0.45.2",
+    "zod": "4.4.3"
+  }
+}
