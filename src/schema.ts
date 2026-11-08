@@ -116,17 +116,21 @@ export const payments = sqliteTable("payments", {
     .$defaultFn(() => new Date()),
 });
 
-// devices: the laundry app's phones/tablets, up to 3 per shop.
-// One shop token is shared by the shop's devices, so a device is told
-// apart by its own device_id (a UUID the app makes at first setup and
-// stores on the phone — never in a backup). The FIRST device registered
-// for a shop is the main device (slot 1); it alone can remove other
-// devices. A revoked device stops syncing and goes view-only.
+// devices: a shop's phones/tablets, up to 3 per shop, whatever app the
+// shop runs (laundry, oil, LIC office, fataka...). One shop token is
+// shared by the shop's devices, so a device is told apart by its own
+// device_id (a UUID the app makes at first setup and stores on the
+// phone — never in a backup). The FIRST device registered for a shop is
+// the main device (slot 1); it alone can remove other devices. A revoked
+// device stops syncing and goes view-only. `software` records the
+// shop's product on the device row (copied from the shop at registration)
+// so the panel's Devices list can show which app each device runs.
 export const devices = sqliteTable("devices", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   shopId: integer("shop_id").notNull(),
   deviceId: text("device_id").notNull(),
   name: text("name").notNull().default(""),
+  software: text("software").notNull().default(""),
   slot: integer("slot").notNull().default(1),
   isMain: integer("is_main").notNull().default(0),
   revoked: integer("revoked").notNull().default(0),
@@ -137,10 +141,12 @@ export const devices = sqliteTable("devices", {
 });
 
 // sync_records: the shop's shared dataset, one row per entity per shop
-// (the latest version — not a history). entity_type is order, customer,
-// payment, rate or setting; entity_id is the app's sync_id (UUID);
-// payload is the entity JSON; updated_at decides last-write-wins;
-// deleted=1 is a tombstone so a delete propagates to other devices.
+// (the latest version — not a history). entity_type is the app's record
+// kind — laundry syncs order/customer/payment/rate/setting, other apps
+// sync their own kinds (policy, stock, scheme, bill, ...); entity_id is
+// the app's sync_id (UUID); payload is the entity JSON; updated_at
+// decides last-write-wins; deleted=1 is a tombstone so a delete
+// propagates to other devices.
 export const syncRecords = sqliteTable("sync_records", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   shopId: integer("shop_id").notNull(),

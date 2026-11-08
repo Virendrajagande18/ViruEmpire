@@ -125,6 +125,18 @@ async function logActivity(ctx: Ctx, action: string, detail: string): Promise<vo
   await db.insert(schema.activityLog).values({ action, detail });
 }
 
+// "Shop Name (Software)" for activity-log lines, so the log always says
+// which product a change belonged to. Bare name when the shop has no
+// software set, "#id" when the shop is gone, null when no shop at all.
+async function shopTag(ctx: Ctx, shopId: number | null): Promise<string | null> {
+  if (shopId === null) return null;
+  const db = ctx.db<typeof schema>();
+  const rows = await db.select().from(schema.shops).where(eq(schema.shops.id, shopId)).limit(1);
+  const s = rows[0];
+  if (!s) return `#${shopId}`;
+  return s.software ? `${s.name} (${s.software})` : s.name;
+}
+
 function defaultExpiryForPlan(plan: string): Date {
   const days = plan === "monthly" ? 30 : plan === "quarterly" ? 90 : 365;
   return new Date(Date.now() + days * 24 * 60 * 60 * 1000);
@@ -703,7 +715,7 @@ export const Actions = {
           ...(joined ? { joinedAt: joined } : {}),
         })
         .where(eq(schema.shops.id, args.id));
-      await logActivity(ctx, "Edited shop", `${args.name} — details updated.`);
+      await logActivity(ctx, "Edited shop", `${args.name}${args.software ? ` (${args.software})` : ""} — details updated.`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -717,7 +729,8 @@ export const Actions = {
       await requireSession(ctx, args.token);
       const db = ctx.db<typeof schema>();
       const shop = await db.select().from(schema.shops).where(eq(schema.shops.id, args.id)).limit(1);
-      const name = shop[0]?.name ?? `#${args.id}`;
+      const s = shop[0];
+      const name = s ? (s.software ? `${s.name} (${s.software})` : s.name) : `#${args.id}`;
       const [keyRows, payRows] = await Promise.all([
         db.select({ id: schema.licenseKeys.id }).from(schema.licenseKeys).where(eq(schema.licenseKeys.shopId, args.id)),
         db.select({ id: schema.payments.id }).from(schema.payments).where(eq(schema.payments.shopId, args.id)),
@@ -739,6 +752,9 @@ export const Actions = {
     async handler(ctx, args): Promise<{ ok: true; keysRevoked: number }> {
       await requireSession(ctx, args.token);
       const db = ctx.db<typeof schema>();
+      const shopRow = await db.select().from(schema.shops).where(eq(schema.shops.id, args.id)).limit(1);
+      const s = shopRow[0];
+      const tag = s ? (s.software ? `${s.name} (${s.software})` : s.name) : `#${args.id}`;
       let keysRevoked = 0;
       if (!args.enabled) {
         await db
@@ -770,7 +786,7 @@ export const Actions = {
           .where(eq(schema.shops.id, args.id));
       }
       await logActivity(ctx, args.enabled ? "Resumed shop" : "Suspended shop",
-        args.enabled ? `Shop #${args.id} — software switched back on.` : `Shop #${args.id} — software off, ${keysRevoked} active key${keysRevoked === 1 ? "" : "s"} revoked.`);
+        args.enabled ? `${tag} — software switched back on.` : `${tag} — software off, ${keysRevoked} active key${keysRevoked === 1 ? "" : "s"} revoked.`);
       ctx.invalidateQueries();
       return { ok: true, keysRevoked };
     },
@@ -844,10 +860,8 @@ export const Actions = {
         })
         .returning({ id: schema.licenseKeys.id });
       if (!row) throw new Error("Could not generate the key.");
-      const shopName = args.shopId > 0
-        ? (await db.select().from(schema.shops).where(eq(schema.shops.id, args.shopId)).limit(1))[0]?.name
-        : null;
-      await logActivity(ctx, "Generated licence key", `${keyCode} — ${args.plan}${shopName ? ` for ${shopName}` : ", unassigned"}.`);
+      const tag = await shopTag(ctx, args.shopId > 0 ? args.shopId : null);
+      await logActivity(ctx, "Generated licence key", `${keyCode} — ${args.plan}${tag ? ` for ${tag}` : ", unassigned"}.`);
       ctx.invalidateQueries();
       return { id: row.id, keyCode };
     },
@@ -866,7 +880,8 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const keyRow = await db.select().from(schema.licenseKeys).where(eq(schema.licenseKeys.id, args.id)).limit(1);
       await db.update(schema.licenseKeys).set({ status: args.status }).where(eq(schema.licenseKeys.id, args.id));
-      await logActivity(ctx, `Key ${args.status}`, `${keyRow[0] ? maskKeyCode(keyRow[0].keyCode) : `#${args.id}`}.`);
+      const tag = keyRow[0] ? await shopTag(ctx, keyRow[0].shopId) : null;
+      await logActivity(ctx, `Key ${args.status}`, `${keyRow[0] ? maskKeyCode(keyRow[0].keyCode) : `#${args.id}`}${tag ? ` — ${tag}` : ""}.`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -909,7 +924,8 @@ export const Actions = {
           .update(schema.licenseKeys)
           .set({ status: "active", expiresAt: null })
           .where(eq(schema.licenseKeys.id, args.id));
-        await logActivity(ctx, "Renewed licence key", `${maskKeyCode(key.keyCode)} — lifetime, reactivated.`);
+        const tag = await shopTag(ctx, key.shopId);
+        await logActivity(ctx, "Renewed licence key", `${maskKeyCode(key.keyCode)} — lifetime, reactivated${tag ? ` for ${tag}` : ""}.`);
         ctx.invalidateQueries();
         return { ok: true, expiresAt: null };
       }
@@ -922,7 +938,8 @@ export const Actions = {
         .update(schema.licenseKeys)
         .set({ status: "active", expiresAt: next })
         .where(eq(schema.licenseKeys.id, args.id));
-      await logActivity(ctx, "Renewed licence key", `${maskKeyCode(key.keyCode)} — now valid till ${dayString(next)}.`);
+      const tag = await shopTag(ctx, key.shopId);
+      await logActivity(ctx, "Renewed licence key", `${maskKeyCode(key.keyCode)} — now valid till ${dayString(next)}${tag ? ` for ${tag}` : ""}.`);
       ctx.invalidateQueries();
       return { ok: true, expiresAt: dayString(next) };
     },
@@ -937,7 +954,8 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const keyRow = await db.select().from(schema.licenseKeys).where(eq(schema.licenseKeys.id, args.id)).limit(1);
       await db.delete(schema.licenseKeys).where(eq(schema.licenseKeys.id, args.id));
-      await logActivity(ctx, "Deleted licence key", `${keyRow[0] ? maskKeyCode(keyRow[0].keyCode) : `#${args.id}`}.`);
+      const tag = keyRow[0] ? await shopTag(ctx, keyRow[0].shopId) : null;
+      await logActivity(ctx, "Deleted licence key", `${keyRow[0] ? maskKeyCode(keyRow[0].keyCode) : `#${args.id}`}${tag ? ` — ${tag}` : ""}.`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -1017,10 +1035,8 @@ export const Actions = {
         })
         .returning({ id: schema.payments.id });
       if (!row) throw new Error("Could not record the payment.");
-      const shopName = args.shopId > 0
-        ? (await db.select().from(schema.shops).where(eq(schema.shops.id, args.shopId)).limit(1))[0]?.name
-        : null;
-      await logActivity(ctx, "Recorded payment", `₹${args.amountInr} (${args.method}, ${args.status})${shopName ? ` from ${shopName}` : " — no shop linked"}.`);
+      const tag = await shopTag(ctx, args.shopId > 0 ? args.shopId : null);
+      await logActivity(ctx, "Recorded payment", `₹${args.amountInr} (${args.method}, ${args.status})${tag ? ` from ${tag}` : " — no shop linked"}.`);
       ctx.invalidateQueries();
       return { id: row.id };
     },
@@ -1039,7 +1055,8 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const payRow = await db.select().from(schema.payments).where(eq(schema.payments.id, args.id)).limit(1);
       await db.update(schema.payments).set({ status: args.status }).where(eq(schema.payments.id, args.id));
-      await logActivity(ctx, `Payment marked ${args.status}`, `${payRow[0] ? `₹${payRow[0].amountInr}` : `Payment #${args.id}`}.`);
+      const tag = payRow[0] ? await shopTag(ctx, payRow[0].shopId) : null;
+      await logActivity(ctx, `Payment marked ${args.status}`, `${payRow[0] ? `₹${payRow[0].amountInr}` : `Payment #${args.id}`}${tag ? ` — ${tag}` : ""}.`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -1075,10 +1092,11 @@ export const Actions = {
         })
         .where(eq(schema.payments.id, args.id));
       const old = before[0];
+      const tag = old ? await shopTag(ctx, old.shopId) : null;
       await logActivity(ctx, "Edited payment",
         old && (old.amountInr !== args.amountInr || old.status !== args.status)
-          ? `₹${old.amountInr} (${old.status}) → ₹${args.amountInr} (${args.status}).`
-          : `Payment #${args.id} — details updated.`);
+          ? `₹${old.amountInr} (${old.status}) → ₹${args.amountInr} (${args.status})${tag ? ` — ${tag}` : ""}.`
+          : `Payment #${args.id} — details updated${tag ? ` (${tag})` : ""}.`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -1168,7 +1186,8 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const payRow = await db.select().from(schema.payments).where(eq(schema.payments.id, args.id)).limit(1);
       await db.delete(schema.payments).where(eq(schema.payments.id, args.id));
-      await logActivity(ctx, "Deleted payment", `${payRow[0] ? `₹${payRow[0].amountInr} (${payRow[0].status})` : `Payment #${args.id}`}.`);
+      const tag = payRow[0] ? await shopTag(ctx, payRow[0].shopId) : null;
+      await logActivity(ctx, "Deleted payment", `${payRow[0] ? `₹${payRow[0].amountInr} (${payRow[0].status})` : `Payment #${args.id}`}${tag ? ` — ${tag}` : ""}.`);
       ctx.invalidateQueries();
       return { ok: true };
     },
