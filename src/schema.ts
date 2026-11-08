@@ -27,6 +27,31 @@ export const sessions = sqliteTable("sessions", {
     .$defaultFn(() => new Date()),
 });
 
+// activity_log: append-only record of every change the CEO makes
+// (shop/key/payment changes, suspend/resume, deletes, clear-all,
+// password change, imports). Clear-all keeps the log, so the wipe
+// itself stays on record.
+export const activityLog = sqliteTable("activity_log", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  action: text("action").notNull(),
+  detail: text("detail").notNull().default(""),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// shop_tokens: one token per shop, minted by the CEO via the server's
+// POST /api/shop-token. The shop phone stores ONLY this token. It can
+// never call /actions and the server scopes every /api/* call to its
+// own shop. Revoked by deleting the row (or minting a replacement).
+export const shopTokens = sqliteTable("shop_tokens", {
+  token: text("token").primaryKey(),
+  shopId: integer("shop_id").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
 export const shops = sqliteTable("shops", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   name: text("name").notNull(),

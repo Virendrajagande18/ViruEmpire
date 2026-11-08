@@ -2,9 +2,10 @@
 //
 // Auth: one CEO account (username + salted SHA-256 password hash) created
 // on first run via setupAccount. login() issues an opaque session token;
-// every data action takes that token and rejects unknown ones. Demo data
-// is seeded once (seedIfEmpty) so the dashboard opens alive; every row is
-// a normal row the CEO can edit or delete.
+// every data action takes that token and rejects unknown ones. Sessions
+// expire 30 days after login. There is no demo or sample data anywhere —
+// the panel starts empty and only ever shows rows the CEO (or a synced
+// shop app) created.
 
 import { defineAction, z, type ActionsModule, type Ctx } from "./sdk-shim.ts";
 import { privileged } from "./privileged.ts";
@@ -27,7 +28,41 @@ async function requireSession(ctx: Ctx, token: string): Promise<string> {
     .limit(1);
   const session = rows[0];
   if (!session) throw new Error("UNAUTHORIZED");
+  // Sessions expire 30 days after login — a token left on a shared phone
+  // stops working on its own.
+  if (Date.now() - session.createdAt.getTime() > SESSION_MAX_AGE_MS) {
+    await db.delete(schema.sessions).where(eq(schema.sessions.token, token));
+    throw new Error("UNAUTHORIZED");
+  }
   return session.username;
+}
+
+// Accepts a CEO session token or a shop token (shop_tokens table).
+// Returns who called, so the server can scope the call. The server
+// enforces the scoping — the actions themselves stay scope-blind.
+async function requireApiToken(
+  ctx: Ctx, token: string
+): Promise<{ scope: "ceo" } | { scope: "shop"; shopId: number }> {
+  const db = ctx.db<typeof schema>();
+  const sessions = await db
+    .select()
+    .from(schema.sessions)
+    .where(eq(schema.sessions.token, token))
+    .limit(1);
+  if (sessions[0]) {
+    if (Date.now() - sessions[0].createdAt.getTime() > SESSION_MAX_AGE_MS) {
+      await db.delete(schema.sessions).where(eq(schema.sessions.token, token));
+      throw new Error("UNAUTHORIZED");
+    }
+    return { scope: "ceo" };
+  }
+  const shopTokens = await db
+    .select()
+    .from(schema.shopTokens)
+    .where(eq(schema.shopTokens.token, token))
+    .limit(1);
+  if (shopTokens[0]) return { scope: "shop", shopId: shopTokens[0].shopId };
+  throw new Error("UNAUTHORIZED");
 }
 
 function dateFromDay(day: string | null | undefined): Date | null {
@@ -44,119 +79,69 @@ function dayString(d: Date | null): string | null {
   return `${y}-${m}-${dd}`;
 }
 
+// Licence-key checksum (must match the app's licenceCheckCode in
+// Licence.kt exactly — same polynomial rolling hash, same base36
+// alphabet). A key is VIRU-A-B-C where C = checkCode(A). The app
+// verifies C offline from the masked key, so a guessed or hand-made
+// key fails even before any sync. Keys generated before this change
+// have a random last block and FAIL the app's check by design — the
+// CEO must generate a fresh key for any shop still on an old one.
+const CHECK_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+export function licenceCheckCode(firstBlock: string): string {
+  let h = 0;
+  const text = `VIRU-${firstBlock}`;
+  for (let i = 0; i < text.length; i++) {
+    h = (h * 31 + text.charCodeAt(i)) % 1679616; // 36^4 — must match the app
+  }
+  let out = "";
+  let v = h;
+  for (let i = 0; i < 4; i++) {
+    out = CHECK_ALPHABET[v % 36] + out;
+    v = Math.floor(v / 36);
+  }
+  return out;
+}
+
 async function genKeyCode(ctx: Ctx): Promise<string> {
   const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  const { values } = await ctx.executePrivileged(privileged.randomValues, { count: 12 });
+  const { values } = await ctx.executePrivileged(privileged.randomValues, { count: 8 });
   const block = (offset: number) => {
     let out = "";
     for (let i = 0; i < 4; i++) out += alphabet[(values[offset + i] ?? 0) % alphabet.length];
     return out;
   };
-  return `VIRU-${block(0)}-${block(4)}-${block(8)}`;
+  const a = block(0);
+  return `VIRU-${a}-${block(4)}-${licenceCheckCode(a)}`;
+}
+
+// ---------- activity log ----------
+// Every change the CEO makes is written here (shop/key/payment changes,
+// suspend/resume, deletes, clear-all, password change, imports), so the
+// CEO can always see what changed and when. Clear-all wipes shops, keys
+// and payments but keeps the log, so the wipe itself stays on record.
+async function logActivity(ctx: Ctx, action: string, detail: string): Promise<void> {
+  const db = ctx.db<typeof schema>();
+  await db.insert(schema.activityLog).values({ action, detail });
+}
+
+function defaultExpiryForPlan(plan: string): Date {
+  const days = plan === "monthly" ? 30 : plan === "quarterly" ? 90 : 365;
+  return new Date(Date.now() + days * 24 * 60 * 60 * 1000);
 }
 
 function maskKeyCode(code: string): string {
   const parts = code.split("-");
   if (parts.length < 2) return code;
+  // Keep the first block AND the checksum block visible: the app needs
+  // both to verify the key offline. The middle block stays masked.
   return parts
-    .map((part, i) => (i === 0 || i === parts.length - 1 ? part : "••••"))
+    .map((part, i) => (i <= 1 || i === parts.length - 1 ? part : "••••"))
     .join("-");
 }
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
-
-// ---------- seed (runs once, only when every table is empty) ----------
-
-async function seedIfEmpty(ctx: Ctx): Promise<void> {
-  const db = ctx.db<typeof schema>();
-  const existing = await db.select({ id: schema.shops.id }).from(schema.shops).limit(1);
-  if (existing.length > 0) return;
-
-  const now = Date.now();
-  const day = 24 * 60 * 60 * 1000;
-  const shopSeed: Array<{
-    name: string; ownerName: string; phone: string; city: string;
-    software: string; status: "active" | "trial" | "suspended" | "closed";
-    notes: string; joinedDaysAgo: number;
-  }> = [
-    { name: "FreshWash Laundry", ownerName: "Ramesh Patil", phone: "98220 41107", city: "Pune", software: "Laundry Management System", status: "active", notes: "First shop onboarded. WhatsApp billing enabled.", joinedDaysAgo: 168 },
-    { name: "Sparkle Clean Hub", ownerName: "Sneha Kulkarni", phone: "98901 22345", city: "Nashik", software: "Laundry Management System", status: "active", notes: "Two counters running on one licence.", joinedDaysAgo: 141 },
-    { name: "Shree Balaji Oil Agency", ownerName: "Suresh Pawar", phone: "97300 88112", city: "Ahmednagar", software: "Oil Dealership Software", status: "active", notes: "Tracks tanker stock, dealer billing and credit ledger.", joinedDaysAgo: 118 },
-    { name: "Sujit Shinde — LIC & Star Health Office", ownerName: "Sujit Shinde", phone: "98225 67431", city: "Pune", software: "LIC & Star Health Office System", status: "active", notes: "Policy renewals and client records for the office.", joinedDaysAgo: 96 },
-    { name: "Royal Fataka Stall", ownerName: "Vikram Jadhav", phone: "96571 30984", city: "Pune", software: "Fataka Stall Website", status: "trial", notes: "Seasonal stall site — trial before Diwali season rush.", joinedDaysAgo: 12 },
-    { name: "QuickWash Express", ownerName: "Pooja Mane", phone: "98909 45120", city: "Ahmednagar", software: "Laundry Management System", status: "suspended", notes: "Payment overdue — licence paused until cleared.", joinedDaysAgo: 74 },
-  ];
-
-  const shopIds: number[] = [];
-  for (const s of shopSeed) {
-    const joined = new Date(now - s.joinedDaysAgo * day);
-    const [row] = await db
-      .insert(schema.shops)
-      .values({
-        name: s.name, ownerName: s.ownerName, phone: s.phone, city: s.city,
-        software: s.software, status: s.status, notes: s.notes,
-        joinedAt: joined, createdAt: joined,
-      })
-      .returning({ id: schema.shops.id });
-    if (row) shopIds.push(row.id);
-  }
-
-  const keySeed: Array<{
-    shop: number; plan: "monthly" | "quarterly" | "yearly" | "lifetime";
-    status: "unused" | "active" | "expired" | "revoked";
-    expiresInDays: number | null; createdDaysAgo: number;
-  }> = [
-    { shop: 0, plan: "yearly", status: "active", expiresInDays: 197, createdDaysAgo: 168 },
-    { shop: 1, plan: "yearly", status: "active", expiresInDays: 224, createdDaysAgo: 141 },
-    { shop: 2, plan: "yearly", status: "active", expiresInDays: 247, createdDaysAgo: 118 },
-    { shop: 3, plan: "monthly", status: "active", expiresInDays: 18, createdDaysAgo: 12 },
-    { shop: 4, plan: "yearly", status: "active", expiresInDays: 269, createdDaysAgo: 96 },
-    { shop: 5, plan: "quarterly", status: "expired", expiresInDays: -9, createdDaysAgo: 83 },
-    { shop: 1, plan: "monthly", status: "active", expiresInDays: 9, createdDaysAgo: 21 },
-    { shop: -1, plan: "yearly", status: "unused", expiresInDays: null, createdDaysAgo: 3 },
-    { shop: -1, plan: "lifetime", status: "unused", expiresInDays: null, createdDaysAgo: 3 },
-    { shop: 0, plan: "monthly", status: "revoked", expiresInDays: 40, createdDaysAgo: 60 },
-  ];
-  for (const k of keySeed) {
-    const created = new Date(now - k.createdDaysAgo * day);
-    await db.insert(schema.licenseKeys).values({
-      keyCode: await genKeyCode(ctx),
-      shopId: k.shop >= 0 ? (shopIds[k.shop] ?? null) : null,
-      plan: k.plan,
-      status: k.status,
-      expiresAt: k.expiresInDays === null ? null : new Date(now + k.expiresInDays * day),
-      createdAt: created,
-    });
-  }
-
-  const paySeed: Array<{
-    shop: number; amount: number;
-    method: "upi" | "cash" | "card" | "bank" | "other";
-    status: "received" | "pending" | "failed" | "refunded";
-    note: string; daysAgo: number;
-  }> = [
-    { shop: 0, amount: 11999, method: "upi", status: "received", note: "Yearly licence — Laundry Management System", daysAgo: 168 },
-    { shop: 1, amount: 11999, method: "bank", status: "received", note: "Yearly licence — Laundry Management System", daysAgo: 141 },
-    { shop: 2, amount: 17999, method: "upi", status: "received", note: "Yearly licence — Oil Dealership Software", daysAgo: 118 },
-    { shop: 3, amount: 14999, method: "card", status: "received", note: "Yearly licence — LIC & Star Health Office System", daysAgo: 96 },
-    { shop: 5, amount: 3499, method: "upi", status: "received", note: "Quarterly licence — Laundry Management System", daysAgo: 83 },
-    { shop: 1, amount: 1499, method: "upi", status: "received", note: "Extra counter add-on", daysAgo: 47 },
-    { shop: 0, amount: 2499, method: "upi", status: "received", note: "WhatsApp billing add-on", daysAgo: 33 },
-    { shop: 2, amount: 2999, method: "card", status: "received", note: "Credit-ledger module add-on", daysAgo: 21 },
-    { shop: 1, amount: 1499, method: "upi", status: "received", note: "Monthly licence — second counter", daysAgo: 21 },
-    { shop: 4, amount: 4999, method: "upi", status: "pending", note: "Fataka Stall Website — season package", daysAgo: 2 },
-    { shop: 5, amount: 3499, method: "upi", status: "pending", note: "Quarterly renewal — overdue", daysAgo: 9 },
-    { shop: 3, amount: 3999, method: "bank", status: "pending", note: "Renewal-reminder add-on — invoice sent", daysAgo: 4 },
-  ];
-  for (const p of paySeed) {
-    const when = new Date(now - p.daysAgo * day);
-    await db.insert(schema.payments).values({
-      shopId: p.shop >= 0 ? (shopIds[p.shop] ?? null) : null,
-      amountInr: p.amount, method: p.method, status: p.status,
-      note: p.note, paidAt: when, createdAt: when,
-    });
-  }
-}
+const SESSION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 // ---------- shared row shapes ----------
 
@@ -199,6 +184,13 @@ const paymentShape = z.object({
 });
 
 const tokenReq = { token: z.string().min(1) };
+
+const activityShape = z.object({
+  id: z.number(),
+  action: z.string(),
+  detail: z.string(),
+  createdAt: z.string(),
+});
 
 const exportShopShape = z.object({
   id: z.number(),
@@ -350,6 +342,7 @@ export const Actions = {
         .update(schema.adminAccount)
         .set({ passwordHash: await hashPassword(ctx, args.newPassword, salt), salt })
         .where(eq(schema.adminAccount.id, account.id));
+      await logActivity(ctx, "Changed CEO password", "CEO login password changed; other sessions signed out.");
       // Every other session is signed out; this session keeps working.
       const sessions = await db.select().from(schema.sessions).where(eq(schema.sessions.username, username));
       for (const s of sessions) {
@@ -368,6 +361,47 @@ export const Actions = {
     async handler(ctx, args) {
       const username = await requireSession(ctx, args.token);
       return { username };
+    },
+  }),
+
+  listActivity: defineAction({
+    description: "Lists the CEO activity log — every key, shop and payment change, newest first.",
+    request: z.object({ ...tokenReq, limit: z.number().int().min(1).max(200).default(100) }),
+    response: z.object({ entries: z.array(activityShape) }),
+    async handler(ctx, args) {
+      await requireSession(ctx, args.token);
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.activityLog).orderBy(desc(schema.activityLog.id)).limit(args.limit);
+      return {
+        entries: rows.map((e) => ({
+          id: e.id,
+          action: e.action,
+          detail: e.detail,
+          createdAt: e.createdAt.toISOString(),
+        })),
+      };
+    },
+  }),
+
+  clearAllData: defineAction({
+    description: "Deletes ALL shops, licence keys and payments at once. The activity log is kept, so the wipe itself stays on record. Use only to start clean.",
+    request: z.object({ ...tokenReq }),
+    response: z.object({ ok: z.literal(true), deletedShops: z.number(), deletedKeys: z.number(), deletedPayments: z.number() }),
+    async handler(ctx, args): Promise<{ ok: true; deletedShops: number; deletedKeys: number; deletedPayments: number }> {
+      await requireSession(ctx, args.token);
+      const db = ctx.db<typeof schema>();
+      const [shopRows, keyRows, payRows] = await Promise.all([
+        db.select({ id: schema.shops.id }).from(schema.shops),
+        db.select({ id: schema.licenseKeys.id }).from(schema.licenseKeys),
+        db.select({ id: schema.payments.id }).from(schema.payments),
+      ]);
+      await db.delete(schema.payments);
+      await db.delete(schema.licenseKeys);
+      await db.delete(schema.shops);
+      await db.delete(schema.shopTokens);
+      await logActivity(ctx, "Cleared all data", `Removed ${shopRows.length} shops, ${keyRows.length} licence keys and ${payRows.length} payments. Activity log kept.`);
+      ctx.invalidateQueries();
+      return { ok: true, deletedShops: shopRows.length, deletedKeys: keyRows.length, deletedPayments: payRows.length };
     },
   }),
 
@@ -404,7 +438,6 @@ export const Actions = {
     privileged: [privileged.randomValues],
     async handler(ctx, args) {
       await requireSession(ctx, args.token);
-      await seedIfEmpty(ctx);
       const db = ctx.db<typeof schema>();
       const [shopRows, keyRows, payRows] = await Promise.all([
         db.select().from(schema.shops).orderBy(desc(schema.shops.id)),
@@ -569,8 +602,7 @@ export const Actions = {
     response: z.object({ shops: z.array(shopShape) }),
     privileged: [privileged.randomValues],
     async handler(ctx, args) {
-      await requireSession(ctx, args.token);
-      await seedIfEmpty(ctx);
+      await requireApiToken(ctx, args.token);
       const db = ctx.db<typeof schema>();
       const [shopRows, keyRows, payRows] = await Promise.all([
         db.select().from(schema.shops).orderBy(desc(schema.shops.id)),
@@ -621,8 +653,12 @@ export const Actions = {
     }),
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
-      await requireSession(ctx, args.token);
+      await requireApiToken(ctx, args.token);
       const db = ctx.db<typeof schema>();
+      const existing = await db.select().from(schema.shops);
+      if (existing.some((s) => s.name === args.name && s.phone === args.phone)) {
+        throw new Error("A shop with this name and phone already exists — edit that shop instead of adding it twice.");
+      }
       const [row] = await db
         .insert(schema.shops)
         .values({
@@ -633,6 +669,7 @@ export const Actions = {
         })
         .returning({ id: schema.shops.id });
       if (!row) throw new Error("Could not add the shop.");
+      await logActivity(ctx, "Added shop", `${args.name}${args.ownerName ? ` — ${args.ownerName}` : ""}${args.software ? ` (${args.software})` : ""}.`);
       ctx.invalidateQueries();
       return { id: row.id };
     },
@@ -654,34 +691,44 @@ export const Actions = {
     }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
-      await requireSession(ctx, args.token);
+      await requireApiToken(ctx, args.token);
       const db = ctx.db<typeof schema>();
+      const joined = dateFromDay(args.joinedAt);
       await db
         .update(schema.shops)
         .set({
           name: args.name, ownerName: args.ownerName, phone: args.phone,
           city: args.city, software: args.software, status: args.status,
           notes: args.notes,
-          joinedAt: dateFromDay(args.joinedAt) ?? new Date(),
+          ...(joined ? { joinedAt: joined } : {}),
         })
         .where(eq(schema.shops.id, args.id));
+      await logActivity(ctx, "Edited shop", `${args.name} — details updated.`);
       ctx.invalidateQueries();
       return { ok: true };
     },
   }),
 
   deleteShop: defineAction({
-    description: "Deletes a shop and unlinks its licence keys and payments.",
+    description: "Deletes a shop and all of its licence keys and payments with it — nothing is left behind as an orphan row.",
     request: z.object({ ...tokenReq, id: z.number().int().positive() }),
-    response: z.object({ ok: z.literal(true) }),
-    async handler(ctx, args): Promise<{ ok: true }> {
+    response: z.object({ ok: z.literal(true), deletedKeys: z.number(), deletedPayments: z.number() }),
+    async handler(ctx, args): Promise<{ ok: true; deletedKeys: number; deletedPayments: number }> {
       await requireSession(ctx, args.token);
       const db = ctx.db<typeof schema>();
-      await db.update(schema.licenseKeys).set({ shopId: null }).where(eq(schema.licenseKeys.shopId, args.id));
-      await db.update(schema.payments).set({ shopId: null }).where(eq(schema.payments.shopId, args.id));
+      const shop = await db.select().from(schema.shops).where(eq(schema.shops.id, args.id)).limit(1);
+      const name = shop[0]?.name ?? `#${args.id}`;
+      const [keyRows, payRows] = await Promise.all([
+        db.select({ id: schema.licenseKeys.id }).from(schema.licenseKeys).where(eq(schema.licenseKeys.shopId, args.id)),
+        db.select({ id: schema.payments.id }).from(schema.payments).where(eq(schema.payments.shopId, args.id)),
+      ]);
+      await db.delete(schema.payments).where(eq(schema.payments.shopId, args.id));
+      await db.delete(schema.licenseKeys).where(eq(schema.licenseKeys.shopId, args.id));
+      await db.delete(schema.shopTokens).where(eq(schema.shopTokens.shopId, args.id));
       await db.delete(schema.shops).where(eq(schema.shops.id, args.id));
+      await logActivity(ctx, "Deleted shop", `${name} — removed ${keyRows.length} licence keys and ${payRows.length} payments with it.`);
       ctx.invalidateQueries();
-      return { ok: true };
+      return { ok: true, deletedKeys: keyRows.length, deletedPayments: payRows.length };
     },
   }),
 
@@ -722,6 +769,8 @@ export const Actions = {
           .set({ status: "active" })
           .where(eq(schema.shops.id, args.id));
       }
+      await logActivity(ctx, args.enabled ? "Resumed shop" : "Suspended shop",
+        args.enabled ? `Shop #${args.id} — software switched back on.` : `Shop #${args.id} — software off, ${keysRevoked} active key${keysRevoked === 1 ? "" : "s"} revoked.`);
       ctx.invalidateQueries();
       return { ok: true, keysRevoked };
     },
@@ -738,8 +787,7 @@ export const Actions = {
     response: z.object({ keys: z.array(keyShape) }),
     privileged: [privileged.randomValues],
     async handler(ctx, args) {
-      await requireSession(ctx, args.token);
-      await seedIfEmpty(ctx);
+      await requireApiToken(ctx, args.token);
       const db = ctx.db<typeof schema>();
       const [keyRows, shopRows] = await Promise.all([
         db.select().from(schema.licenseKeys).orderBy(desc(schema.licenseKeys.id)),
@@ -790,10 +838,16 @@ export const Actions = {
           shopId: args.shopId > 0 ? args.shopId : null,
           plan: args.plan,
           status: args.status,
-          expiresAt: args.plan === "lifetime" ? null : dateFromDay(args.expiresAt),
+          // A missing or bad expiry date falls back to the plan length —
+          // a yearly key must never end up with no expiry at all.
+          expiresAt: args.plan === "lifetime" ? null : (dateFromDay(args.expiresAt) ?? defaultExpiryForPlan(args.plan)),
         })
         .returning({ id: schema.licenseKeys.id });
       if (!row) throw new Error("Could not generate the key.");
+      const shopName = args.shopId > 0
+        ? (await db.select().from(schema.shops).where(eq(schema.shops.id, args.shopId)).limit(1))[0]?.name
+        : null;
+      await logActivity(ctx, "Generated licence key", `${keyCode} — ${args.plan}${shopName ? ` for ${shopName}` : ", unassigned"}.`);
       ctx.invalidateQueries();
       return { id: row.id, keyCode };
     },
@@ -810,7 +864,9 @@ export const Actions = {
     async handler(ctx, args): Promise<{ ok: true }> {
       await requireSession(ctx, args.token);
       const db = ctx.db<typeof schema>();
+      const keyRow = await db.select().from(schema.licenseKeys).where(eq(schema.licenseKeys.id, args.id)).limit(1);
       await db.update(schema.licenseKeys).set({ status: args.status }).where(eq(schema.licenseKeys.id, args.id));
+      await logActivity(ctx, `Key ${args.status}`, `${keyRow[0] ? maskKeyCode(keyRow[0].keyCode) : `#${args.id}`}.`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -853,6 +909,7 @@ export const Actions = {
           .update(schema.licenseKeys)
           .set({ status: "active", expiresAt: null })
           .where(eq(schema.licenseKeys.id, args.id));
+        await logActivity(ctx, "Renewed licence key", `${maskKeyCode(key.keyCode)} — lifetime, reactivated.`);
         ctx.invalidateQueries();
         return { ok: true, expiresAt: null };
       }
@@ -865,6 +922,7 @@ export const Actions = {
         .update(schema.licenseKeys)
         .set({ status: "active", expiresAt: next })
         .where(eq(schema.licenseKeys.id, args.id));
+      await logActivity(ctx, "Renewed licence key", `${maskKeyCode(key.keyCode)} — now valid till ${dayString(next)}.`);
       ctx.invalidateQueries();
       return { ok: true, expiresAt: dayString(next) };
     },
@@ -877,7 +935,9 @@ export const Actions = {
     async handler(ctx, args): Promise<{ ok: true }> {
       await requireSession(ctx, args.token);
       const db = ctx.db<typeof schema>();
+      const keyRow = await db.select().from(schema.licenseKeys).where(eq(schema.licenseKeys.id, args.id)).limit(1);
       await db.delete(schema.licenseKeys).where(eq(schema.licenseKeys.id, args.id));
+      await logActivity(ctx, "Deleted licence key", `${keyRow[0] ? maskKeyCode(keyRow[0].keyCode) : `#${args.id}`}.`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -891,11 +951,13 @@ export const Actions = {
       status: z.string().max(20).default("all"),
       method: z.string().max(20).default("all"),
     }),
-    response: z.object({ payments: z.array(paymentShape) }),
+    response: z.object({
+      payments: z.array(paymentShape),
+      totals: z.object({ receivedInr: z.number(), pendingInr: z.number(), count: z.number() }),
+    }),
     privileged: [privileged.randomValues],
     async handler(ctx, args) {
       await requireSession(ctx, args.token);
-      await seedIfEmpty(ctx);
       const db = ctx.db<typeof schema>();
       const [payRows, shopRows] = await Promise.all([
         db.select().from(schema.payments).orderBy(desc(schema.payments.paidAt)),
@@ -911,6 +973,13 @@ export const Actions = {
         const name = p.shopId !== null ? (shopName.get(p.shopId) ?? "") : "";
         return name.toLowerCase().includes(q) || p.note.toLowerCase().includes(q);
       });
+      // Totals are always over ALL payments, never over the filtered list —
+      // a search or filter must never make the totals look wrong.
+      const totals = {
+        receivedInr: payRows.filter((p) => p.status === "received").reduce((s, p) => s + p.amountInr, 0),
+        pendingInr: payRows.filter((p) => p.status === "pending").reduce((s, p) => s + p.amountInr, 0),
+        count: payRows.length,
+      };
       return {
         payments: filtered.map((p) => ({
           id: p.id, shopId: p.shopId,
@@ -919,6 +988,7 @@ export const Actions = {
           amountInr: p.amountInr, method: p.method, status: p.status,
           note: p.note, paidAt: dayString(p.paidAt) ?? "",
         })),
+        totals,
       };
     },
   }),
@@ -936,7 +1006,7 @@ export const Actions = {
     }),
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
-      await requireSession(ctx, args.token);
+      await requireApiToken(ctx, args.token);
       const db = ctx.db<typeof schema>();
       const [row] = await db
         .insert(schema.payments)
@@ -947,6 +1017,10 @@ export const Actions = {
         })
         .returning({ id: schema.payments.id });
       if (!row) throw new Error("Could not record the payment.");
+      const shopName = args.shopId > 0
+        ? (await db.select().from(schema.shops).where(eq(schema.shops.id, args.shopId)).limit(1))[0]?.name
+        : null;
+      await logActivity(ctx, "Recorded payment", `₹${args.amountInr} (${args.method}, ${args.status})${shopName ? ` from ${shopName}` : " — no shop linked"}.`);
       ctx.invalidateQueries();
       return { id: row.id };
     },
@@ -963,7 +1037,9 @@ export const Actions = {
     async handler(ctx, args): Promise<{ ok: true }> {
       await requireSession(ctx, args.token);
       const db = ctx.db<typeof schema>();
+      const payRow = await db.select().from(schema.payments).where(eq(schema.payments.id, args.id)).limit(1);
       await db.update(schema.payments).set({ status: args.status }).where(eq(schema.payments.id, args.id));
+      await logActivity(ctx, `Payment marked ${args.status}`, `${payRow[0] ? `₹${payRow[0].amountInr}` : `Payment #${args.id}`}.`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -985,6 +1061,8 @@ export const Actions = {
     async handler(ctx, args): Promise<{ ok: true }> {
       await requireSession(ctx, args.token);
       const db = ctx.db<typeof schema>();
+      const before = await db.select().from(schema.payments).where(eq(schema.payments.id, args.id)).limit(1);
+      const paid = dateFromDay(args.paidAt);
       await db
         .update(schema.payments)
         .set({
@@ -993,9 +1071,14 @@ export const Actions = {
           method: args.method,
           status: args.status,
           note: args.note,
-          paidAt: dateFromDay(args.paidAt) ?? new Date(),
+          ...(paid ? { paidAt: paid } : {}),
         })
         .where(eq(schema.payments.id, args.id));
+      const old = before[0];
+      await logActivity(ctx, "Edited payment",
+        old && (old.amountInr !== args.amountInr || old.status !== args.status)
+          ? `₹${old.amountInr} (${old.status}) → ₹${args.amountInr} (${args.status}).`
+          : `Payment #${args.id} — details updated.`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -1020,7 +1103,6 @@ export const Actions = {
     privileged: [privileged.randomValues],
     async handler(ctx, args) {
       const username = await requireSession(ctx, args.token);
-      await seedIfEmpty(ctx);
       const db = ctx.db<typeof schema>();
       const [shopRows, keyRows, payRows] = await Promise.all([
         db.select().from(schema.shops).orderBy(desc(schema.shops.id)),
@@ -1084,7 +1166,9 @@ export const Actions = {
     async handler(ctx, args): Promise<{ ok: true }> {
       await requireSession(ctx, args.token);
       const db = ctx.db<typeof schema>();
+      const payRow = await db.select().from(schema.payments).where(eq(schema.payments.id, args.id)).limit(1);
       await db.delete(schema.payments).where(eq(schema.payments.id, args.id));
+      await logActivity(ctx, "Deleted payment", `${payRow[0] ? `₹${payRow[0].amountInr} (${payRow[0].status})` : `Payment #${args.id}`}.`);
       ctx.invalidateQueries();
       return { ok: true };
     },
@@ -1226,6 +1310,7 @@ export const Actions = {
         importedPayments += 1;
       }
 
+      await logActivity(ctx, "Imported backup", `${importedShops} shops, ${importedKeys} keys, ${importedPayments} payments added (${skipped} already here).`);
       ctx.invalidateQueries();
       return { ok: true as const, importedShops, importedKeys, importedPayments, skipped };
     },
