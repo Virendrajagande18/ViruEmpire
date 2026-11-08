@@ -112,6 +112,34 @@ CREATE TABLE IF NOT EXISTS payments (
   paid_at INTEGER NOT NULL,
   created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS devices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id INTEGER NOT NULL,
+  device_id TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  slot INTEGER NOT NULL DEFAULT 1,
+  is_main INTEGER NOT NULL DEFAULT 0,
+  revoked INTEGER NOT NULL DEFAULT 0,
+  last_sync_at INTEGER,
+  created_at INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_shop_device ON devices (shop_id, device_id);
+CREATE TABLE IF NOT EXISTS sync_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id INTEGER NOT NULL,
+  entity_type TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  payload TEXT NOT NULL DEFAULT '{}',
+  updated_at INTEGER NOT NULL DEFAULT 0,
+  device_id TEXT NOT NULL DEFAULT '',
+  deleted INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_records_shop_entity ON sync_records (shop_id, entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_sync_records_updated ON sync_records (shop_id, updated_at);
+CREATE TABLE IF NOT EXISTS sync_meta (
+  shop_id INTEGER PRIMARY KEY,
+  epoch TEXT NOT NULL
+);
 `;
 sqlite.exec(CREATE_TABLES);
 
@@ -578,6 +606,162 @@ Bun.serve({
         if (r.error) return bad(r.error, 400);
         return json(r.data);
       }
+      // ---- Multi-device sync (LaundryX v1.1.5) ----
+      // The shop's devices share ONE shop token, so a device is told
+      // apart by its own deviceId (a UUID the app makes at first setup
+      // and stores on the phone — never in a backup). Every call below
+      // is shop-scoped: a token can only touch its own shop's devices
+      // and data. Licence/token endpoints above are untouched.
+      const MAX_DEVICES = 3;
+      const SYNC_TYPES = ["order", "customer", "payment", "rate", "setting"];
+      function shopEpoch(shopId: number): string {
+        const row = sqlite.query("SELECT epoch FROM sync_meta WHERE shop_id = ?").get(shopId) as { epoch: string } | undefined;
+        if (row) return row.epoch;
+        const epoch = randomBytes(16).toString("hex");
+        sqlite.query("INSERT INTO sync_meta (shop_id, epoch) VALUES (?, ?)").run(shopId, epoch);
+        return epoch;
+      }
+      function deviceRow(shopId: number, deviceId: string): any {
+        return sqlite.query("SELECT * FROM devices WHERE shop_id = ? AND device_id = ?").get(shopId, deviceId);
+      }
+
+      // Register a device for the shop. First device = main (slot 1).
+      // Idempotent: re-registering the same deviceId returns its record.
+      if (path === "/api/devices/register" && req.method === "POST") {
+        if (!isShop) return bad("Only a shop device can register.", 403);
+        const body = await readJson(req);
+        const deviceId = String(body?.deviceId ?? "").trim().slice(0, 64);
+        const name = String(body?.deviceName ?? "").trim().slice(0, 80);
+        if (!deviceId) return bad("deviceId is required.");
+        const shopId = auth.shopId!;
+        const existing = deviceRow(shopId, deviceId);
+        if (existing) {
+          return json({ deviceId, slot: existing.slot, isMain: existing.is_main === 1, revoked: existing.revoked === 1, epoch: shopEpoch(shopId) });
+        }
+        // The cap counts ACTIVE devices only: a revoked device frees
+        // its slot, so a replacement phone can join after the old one
+        // is removed (device lost). Revoked rows stay listed in the
+        // panel/devices list — they just do not hold a slot.
+        const countRow = sqlite.query("SELECT COUNT(*) AS n FROM devices WHERE shop_id = ? AND revoked = 0").get(shopId) as { n: number };
+        if (countRow.n >= MAX_DEVICES) {
+          return bad("This shop already has 3 devices. Remove one from the main device first.", 403);
+        }
+        const slotRow = sqlite.query("SELECT COALESCE(MAX(slot), 0) AS m FROM devices WHERE shop_id = ?").get(shopId) as { m: number };
+        const slot = slotRow.m + 1;
+        const isMain = countRow.n === 0 ? 1 : 0;
+        sqlite.query(
+          "INSERT INTO devices (shop_id, device_id, name, slot, is_main, revoked, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)"
+        ).run(shopId, deviceId, name, slot, isMain, Date.now());
+        return json({ deviceId, slot, isMain: isMain === 1, revoked: false, epoch: shopEpoch(shopId) });
+      }
+
+      // List the shop's devices (for the main device's Settings screen).
+      if (path === "/api/devices" && req.method === "GET") {
+        if (!isShop) return bad("Only a shop device can list devices.", 403);
+        const shopId = auth.shopId!;
+        const rows = sqlite.query(
+          "SELECT device_id AS deviceId, name, slot, is_main AS isMain, revoked, last_sync_at AS lastSyncAt FROM devices WHERE shop_id = ? ORDER BY slot"
+        ).all(shopId) as any[];
+        return json({ devices: rows.map((r) => ({ ...r, isMain: r.isMain === 1, revoked: r.revoked === 1 })) });
+      }
+
+      // List a shop's devices for the CEO panel (main-device-lost
+      // recovery: the panel shows which device is main and lets the CEO
+      // assign a new one). CEO only — a shop token cannot list another
+      // shop's devices, and it has no shop id of its own to ask about.
+      if (path.startsWith("/api/shops/") && path.endsWith("/devices") && req.method === "GET") {
+        if (isShop) return bad("Only the CEO can list a shop's devices.", 403);
+        const shopId = Number(path.split("/")[3] ?? "");
+        if (!shopId) return bad("Shop id is required.");
+        const rows = sqlite.query(
+          "SELECT device_id AS deviceId, name, slot, is_main AS isMain, revoked, last_sync_at AS lastSyncAt FROM devices WHERE shop_id = ? ORDER BY slot"
+        ).all(shopId) as any[];
+        return json({ devices: rows.map((r) => ({ ...r, isMain: r.isMain === 1, revoked: r.revoked === 1 })) });
+      }
+
+      // Push + pull in one request (delta sync). Body:
+      // {deviceId, since, changes: [{type, id, payload, updatedAt, deleted}]}
+      // Last-write-wins by updatedAt per entity; a tie keeps the higher
+      // deviceId so every device agrees. Payments are separate records,
+      // so two payments on one order never overwrite each other.
+      if (path === "/api/sync" && req.method === "POST") {
+        if (!isShop) return bad("Only a shop device can sync data.", 403);
+        const body = await readJson(req);
+        const deviceId = String(body?.deviceId ?? "").trim().slice(0, 64);
+        const since = Number(body?.since ?? 0) || 0;
+        const shopId = auth.shopId!;
+        const dev = deviceRow(shopId, deviceId);
+        if (!dev) return bad("Unknown device — register this device first.", 401);
+        if (dev.revoked === 1) return json({ revoked: true, error: "This device was removed by the main device." }, 403);
+        const changes = Array.isArray(body?.changes) ? body.changes : [];
+        if (changes.length > 500) return bad("Too many changes in one sync (max 500).");
+        const now = Date.now();
+        for (const c of changes) {
+          const type = String(c?.type ?? "");
+          const id = String(c?.id ?? "").trim().slice(0, 128);
+          const updatedAt = Number(c?.updatedAt ?? 0) || 0;
+          if (!SYNC_TYPES.includes(type) || !id || updatedAt <= 0) continue;
+          const payload = typeof c?.payload === "string" ? c.payload : JSON.stringify(c?.payload ?? {});
+          const deleted = c?.deleted === true || c?.deleted === 1 ? 1 : 0;
+          const cur = sqlite.query(
+            "SELECT updated_at, device_id FROM sync_records WHERE shop_id = ? AND entity_type = ? AND entity_id = ?"
+          ).get(shopId, type, id) as { updated_at: number; device_id: string } | undefined;
+          if (cur && (cur.updated_at > updatedAt || (cur.updated_at === updatedAt && cur.device_id >= deviceId))) continue;
+          sqlite.query(
+            "INSERT INTO sync_records (shop_id, entity_type, entity_id, payload, updated_at, device_id, deleted) VALUES (?, ?, ?, ?, ?, ?, ?) " +
+            "ON CONFLICT(shop_id, entity_type, entity_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at, device_id = excluded.device_id, deleted = excluded.deleted"
+          ).run(shopId, type, id, payload, updatedAt, deviceId, deleted);
+        }
+        sqlite.query("UPDATE devices SET last_sync_at = ? WHERE shop_id = ? AND device_id = ?").run(now, shopId, deviceId);
+        const pulled = sqlite.query(
+          "SELECT entity_type AS type, entity_id AS id, payload, updated_at AS updatedAt, deleted FROM sync_records WHERE shop_id = ? AND updated_at > ? ORDER BY updated_at ASC"
+        ).all(shopId, since) as any[];
+        const deviceCount = (sqlite.query("SELECT COUNT(*) AS n FROM devices WHERE shop_id = ? AND revoked = 0").get(shopId) as { n: number }).n;
+        return json({
+          changes: pulled.map((r) => ({ ...r, deleted: r.deleted === 1, payload: JSON.parse(r.payload || "{}") })),
+          serverTime: now,
+          revoked: false,
+          isMain: dev.is_main === 1,
+          deviceCount,
+          epoch: shopEpoch(shopId),
+        });
+      }
+
+      // Revoke / re-add a device. Caller must be the shop's main device
+      // (it sends its own deviceId as callerDeviceId). The main device
+      // itself can never be removed — assign a new main first.
+      if (path.startsWith("/api/devices/") && path.endsWith("/revoke") && req.method === "POST") {
+        if (!isShop) return bad("Only a shop device can remove devices.", 403);
+        const targetId = decodeURIComponent(path.split("/")[3] ?? "");
+        const body = await readJson(req);
+        const callerId = String(body?.callerDeviceId ?? "").trim().slice(0, 64);
+        const shopId = auth.shopId!;
+        const caller = deviceRow(shopId, callerId);
+        if (!caller || caller.is_main !== 1 || caller.revoked === 1) {
+          return bad("Only the main device can remove devices.", 403);
+        }
+        const target = deviceRow(shopId, targetId);
+        if (!target) return bad("Device not found.");
+        if (target.is_main === 1) {
+          return bad("The main device cannot be removed. Assign a new main device first.");
+        }
+        const revoked = body?.revoked === false ? 0 : 1;
+        sqlite.query("UPDATE devices SET revoked = ? WHERE shop_id = ? AND device_id = ?").run(revoked, shopId, targetId);
+        return json({ deviceId: targetId, revoked: revoked === 1 });
+      }
+
+      // Assign a new main device — CEO only (panel control for the
+      // "main device lost" case). The new main picks it up on next sync.
+      if (path.startsWith("/api/devices/") && path.endsWith("/set-main") && req.method === "POST") {
+        if (isShop) return bad("Only the CEO can assign the main device.", 403);
+        const targetId = decodeURIComponent(path.split("/")[3] ?? "");
+        const target = sqlite.query("SELECT * FROM devices WHERE device_id = ?").get(targetId) as any;
+        if (!target) return bad("Device not found.");
+        sqlite.query("UPDATE devices SET is_main = 0 WHERE shop_id = ?").run(target.shop_id);
+        sqlite.query("UPDATE devices SET is_main = 1, revoked = 0 WHERE shop_id = ? AND device_id = ?").run(target.shop_id, targetId);
+        return json({ deviceId: targetId, shopId: target.shop_id, isMain: true });
+      }
+
       return bad("Unknown API endpoint.", 404);
     }
 
