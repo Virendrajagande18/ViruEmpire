@@ -36,13 +36,16 @@
 //  licenceCheckCode in Licence.kt). The app verifies the checksum
 //  offline from the masked key, so guessed keys fail.
 //
-// Data lives in a SQLite file (data/viru-empire.db). On Render's free tier
-// the file survives sleeps and restarts, but is wiped on redeploy — the
-// panel's Export / Backup is the safety net, so export regularly.
+// Data lives in Turso (a hosted SQLite-compatible database) — NOT in a
+// file on this server. Render's free tier wipes the server's own files
+// whenever it sleeps (~15 min idle) or redeploys, which is how shops
+// added to the panel vanished overnight. Turso keeps the data no matter
+// how often the server sleeps or restarts — the panel's Export / Backup
+// stays as a second safety net, so export regularly anyway.
 
-import { Database } from "bun:sqlite";
+import { createClient, type Client } from "@libsql/client";
 import { createHash, randomBytes } from "node:crypto";
-import { drizzle } from "drizzle-orm/bun-sqlite";
+import { drizzle } from "drizzle-orm/libsql";
 import { eq } from "drizzle-orm";
 import { Actions } from "./src/actions";
 import * as schema from "./src/schema";
@@ -50,15 +53,43 @@ import { normalizeSoftware, PRODUCTS } from "./src/products";
 import { privilegedHandlers } from "./src/privileged";
 
 const PORT = Number(process.env.PORT ?? 3000);
-const DB_PATH = process.env.DB_PATH ?? "./data/viru-empire.db";
 const CLIENT_DIR = "./client-dist";
 
 // ---------- database ----------
+// Turso is the ONLY store. The URL and auth token come from the Render
+// dashboard (Environment) only — never from a file, never from the repo.
+// If they are missing the server refuses to start rather than silently
+// using a local file: a local file would look fine and then lose data
+// again the next time the server sleeps. The token stays server-side
+// only — it is never sent to the client bundle or any API response.
+const TURSO_URL = process.env.TURSO_DATABASE_URL?.trim();
+const TURSO_TOKEN = process.env.TURSO_AUTH_TOKEN?.trim();
+if (!TURSO_URL) {
+  console.error(
+    "FATAL: TURSO_DATABASE_URL is not set. The CEO panel stores its data in Turso — " +
+      "set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN in the Render dashboard (Environment) and redeploy. " +
+      "The server will not start without them."
+  );
+  process.exit(1);
+}
+const turso: Client = createClient({ url: TURSO_URL, authToken: TURSO_TOKEN || undefined });
+const db = drizzle(turso, { schema });
 
-const sqlite = new Database(DB_PATH);
-sqlite.exec("PRAGMA journal_mode = WAL;");
-sqlite.exec("PRAGMA foreign_keys = ON;");
-const db = drizzle(sqlite, { schema });
+// Raw SQL through the Turso client. One execute per old bun:sqlite call —
+// no extra queries. Rows come back as plain objects keyed by column name,
+// the same shape the old code read.
+async function sqlOne<T>(sql: string, ...args: (string | number | null)[]): Promise<T | undefined> {
+  const r = await turso.execute({ sql, args });
+  return r.rows[0] as T | undefined;
+}
+async function sqlAll<T>(sql: string, ...args: (string | number | null)[]): Promise<T[]> {
+  const r = await turso.execute({ sql, args });
+  return r.rows as T[];
+}
+async function sqlRun(sql: string, ...args: (string | number | null)[]): Promise<{ changes: number }> {
+  const r = await turso.execute({ sql, args });
+  return { changes: Number(r.rowsAffected ?? 0) };
+}
 
 const CREATE_TABLES = `
 CREATE TABLE IF NOT EXISTS admin_account (
@@ -145,14 +176,13 @@ CREATE TABLE IF NOT EXISTS sync_meta (
   epoch TEXT NOT NULL
 );
 `;
-sqlite.exec(CREATE_TABLES);
+await turso.executeMultiple(CREATE_TABLES);
 
-// Additive migration for databases created before devices carried a
-// software name: add the column when it is missing, leave data alone.
-const deviceCols = sqlite.query("PRAGMA table_info(devices)").all() as { name: string }[];
-if (!deviceCols.some((c) => c.name === "software")) {
-  sqlite.exec("ALTER TABLE devices ADD COLUMN software TEXT NOT NULL DEFAULT ''");
-}
+// No additive migration is needed here: a Turso database is created
+// fresh, so CREATE TABLE above already includes the devices.software
+// column. (The old local SQLite files — the only databases that could
+// lack the column — are abandoned with this move; their data is gone
+// with the wiped files, which is exactly the bug being fixed.)
 
 // First-run CEO account from environment variables (set in the Render
 // dashboard, never in a file): if no account exists yet, create the one
@@ -161,13 +191,17 @@ if (!deviceCols.some((c) => c.name === "software")) {
 const envUser = process.env.CEO_USERNAME?.trim();
 const envPass = process.env.CEO_PASSWORD ?? "";
 if (envUser && envPass) {
-  const existing = sqlite.query("SELECT id FROM admin_account LIMIT 1").get();
+  const existing = await sqlOne<{ id: number }>("SELECT id FROM admin_account LIMIT 1");
   if (!existing) {
     const salt = randomBytes(16).toString("hex");
     const hash = createHash("sha256").update(`${salt}:${envPass}`).digest("hex");
-    sqlite
-      .prepare("INSERT INTO admin_account (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)")
-      .run(envUser, hash, salt, Date.now());
+    await sqlRun(
+      "INSERT INTO admin_account (username, password_hash, salt, created_at) VALUES (?, ?, ?, ?)",
+      envUser,
+      hash,
+      salt,
+      Date.now()
+    );
     console.log(`CEO account created for '${envUser}' from environment.`);
   }
 }
@@ -226,9 +260,7 @@ async function requireAuth(req: Request): Promise<ApiAuth | null> {
     }
     return { scope: "ceo", token, shopId: null };
   }
-  const shopRows = sqlite
-    .query("SELECT shop_id FROM shop_tokens WHERE token = ?")
-    .all(token) as { shop_id: number }[];
+  const shopRows = await sqlAll<{ shop_id: number }>("SELECT shop_id FROM shop_tokens WHERE token = ?", token);
   if (shopRows[0]) return { scope: "shop", token, shopId: shopRows[0].shop_id };
   return null;
 }
@@ -484,14 +516,17 @@ Bun.serve({
         }
         if (!shopId) return bad("Shop not found.");
         if (body?.revoke === true) {
-          const deleted = sqlite.query("DELETE FROM shop_tokens WHERE shop_id = ?").run(shopId);
+          const deleted = await sqlRun("DELETE FROM shop_tokens WHERE shop_id = ?", shopId);
           return json({ revoked: deleted.changes ?? 0, shopId });
         }
-        sqlite.query("DELETE FROM shop_tokens WHERE shop_id = ?").run(shopId);
+        await sqlRun("DELETE FROM shop_tokens WHERE shop_id = ?", shopId);
         const shopToken = randomBytes(32).toString("hex");
-        sqlite
-          .query("INSERT INTO shop_tokens (token, shop_id, created_at) VALUES (?, ?, ?)")
-          .run(shopToken, shopId, Date.now());
+        await sqlRun(
+          "INSERT INTO shop_tokens (token, shop_id, created_at) VALUES (?, ?, ?)",
+          shopToken,
+          shopId,
+          Date.now()
+        );
         return json({ token: shopToken, shopId });
       }
 
@@ -640,26 +675,26 @@ Bun.serve({
       // kinds of records. Only the SHAPE is checked — a short lowercase
       // slug — so a new product never needs a server change to sync.
       const SYNC_TYPE_RE = /^[a-z][a-z0-9_-]{0,31}$/;
-      function shopEpoch(shopId: number): string {
-        const row = sqlite.query("SELECT epoch FROM sync_meta WHERE shop_id = ?").get(shopId) as { epoch: string } | undefined;
+      async function shopEpoch(shopId: number): Promise<string> {
+        const row = await sqlOne<{ epoch: string }>("SELECT epoch FROM sync_meta WHERE shop_id = ?", shopId);
         if (row) return row.epoch;
         const epoch = randomBytes(16).toString("hex");
-        sqlite.query("INSERT INTO sync_meta (shop_id, epoch) VALUES (?, ?)").run(shopId, epoch);
+        await sqlRun("INSERT INTO sync_meta (shop_id, epoch) VALUES (?, ?)", shopId, epoch);
         return epoch;
       }
-      function deviceRow(shopId: number, deviceId: string): any {
-        return sqlite.query("SELECT * FROM devices WHERE shop_id = ? AND device_id = ?").get(shopId, deviceId);
+      async function deviceRow(shopId: number, deviceId: string): Promise<any> {
+        return sqlOne("SELECT * FROM devices WHERE shop_id = ? AND device_id = ?", shopId, deviceId);
       }
-      function shopSoftwareOf(shopId: number): string {
-        const row = sqlite.query("SELECT software FROM shops WHERE id = ?").get(shopId) as { software: string } | undefined;
+      async function shopSoftwareOf(shopId: number): Promise<string> {
+        const row = await sqlOne<{ software: string }>("SELECT software FROM shops WHERE id = ?", shopId);
         return normalizeSoftware(row?.software ?? "");
       }
       // The app may announce which product it is (software / app). When
       // the shop already has a product set, the announced one must match
       // it — a laundry app must never register against an oil shop.
       // Returns the shop's software (the source of truth) or an error.
-      function checkAppSoftware(shopId: number, body: any): { software: string } | { error: string } {
-        const shopSoftware = shopSoftwareOf(shopId);
+      async function checkAppSoftware(shopId: number, body: any): Promise<{ software: string } | { error: string }> {
+        const shopSoftware = await shopSoftwareOf(shopId);
         const announced = normalizeSoftware(body?.software ?? body?.app ?? body?.appType ?? "");
         if (announced && shopSoftware && announced !== shopSoftware) {
           return { error: `This shop runs ${shopSoftware}, not ${announced}.` };
@@ -676,36 +711,38 @@ Bun.serve({
         const name = String(body?.deviceName ?? "").trim().slice(0, 80);
         if (!deviceId) return bad("deviceId is required.");
         const shopId = auth.shopId!;
-        const app = checkAppSoftware(shopId, body);
+        const app = await checkAppSoftware(shopId, body);
         if ("error" in app) return bad(app.error, 400);
-        const existing = deviceRow(shopId, deviceId);
+        const existing = await deviceRow(shopId, deviceId);
         if (existing) {
-          return json({ deviceId, slot: existing.slot, isMain: existing.is_main === 1, revoked: existing.revoked === 1, software: app.software, epoch: shopEpoch(shopId) });
+          return json({ deviceId, slot: existing.slot, isMain: existing.is_main === 1, revoked: existing.revoked === 1, software: app.software, epoch: await shopEpoch(shopId) });
         }
         // The cap counts ACTIVE devices only: a revoked device frees
         // its slot, so a replacement phone can join after the old one
         // is removed (device lost). Revoked rows stay listed in the
         // panel/devices list — they just do not hold a slot.
-        const countRow = sqlite.query("SELECT COUNT(*) AS n FROM devices WHERE shop_id = ? AND revoked = 0").get(shopId) as { n: number };
-        if (countRow.n >= MAX_DEVICES) {
+        const countRow = await sqlOne<{ n: number }>("SELECT COUNT(*) AS n FROM devices WHERE shop_id = ? AND revoked = 0", shopId);
+        if ((countRow?.n ?? 0) >= MAX_DEVICES) {
           return bad("This shop already has 3 devices. Remove one from the main device first.", 403);
         }
-        const slotRow = sqlite.query("SELECT COALESCE(MAX(slot), 0) AS m FROM devices WHERE shop_id = ?").get(shopId) as { m: number };
-        const slot = slotRow.m + 1;
-        const isMain = countRow.n === 0 ? 1 : 0;
-        sqlite.query(
-          "INSERT INTO devices (shop_id, device_id, name, software, slot, is_main, revoked, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)"
-        ).run(shopId, deviceId, name, app.software, slot, isMain, Date.now());
-        return json({ deviceId, slot, isMain: isMain === 1, revoked: false, software: app.software, epoch: shopEpoch(shopId) });
+        const slotRow = await sqlOne<{ m: number }>("SELECT COALESCE(MAX(slot), 0) AS m FROM devices WHERE shop_id = ?", shopId);
+        const slot = (slotRow?.m ?? 0) + 1;
+        const isMain = (countRow?.n ?? 0) === 0 ? 1 : 0;
+        await sqlRun(
+          "INSERT INTO devices (shop_id, device_id, name, software, slot, is_main, revoked, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+          shopId, deviceId, name, app.software, slot, isMain, Date.now()
+        );
+        return json({ deviceId, slot, isMain: isMain === 1, revoked: false, software: app.software, epoch: await shopEpoch(shopId) });
       }
 
       // List the shop's devices (for the main device's Settings screen).
       if (path === "/api/devices" && req.method === "GET") {
         if (!isShop) return bad("Only a shop device can list devices.", 403);
         const shopId = auth.shopId!;
-        const rows = sqlite.query(
-          "SELECT device_id AS deviceId, name, software, slot, is_main AS isMain, revoked, last_sync_at AS lastSyncAt FROM devices WHERE shop_id = ? ORDER BY slot"
-        ).all(shopId) as any[];
+        const rows = await sqlAll<any>(
+          "SELECT device_id AS deviceId, name, software, slot, is_main AS isMain, revoked, last_sync_at AS lastSyncAt FROM devices WHERE shop_id = ? ORDER BY slot",
+          shopId
+        );
         return json({ devices: rows.map((r) => ({ ...r, isMain: r.isMain === 1, revoked: r.revoked === 1 })) });
       }
 
@@ -717,9 +754,10 @@ Bun.serve({
         if (isShop) return bad("Only the CEO can list a shop's devices.", 403);
         const shopId = Number(path.split("/")[3] ?? "");
         if (!shopId) return bad("Shop id is required.");
-        const rows = sqlite.query(
-          "SELECT device_id AS deviceId, name, software, slot, is_main AS isMain, revoked, last_sync_at AS lastSyncAt FROM devices WHERE shop_id = ? ORDER BY slot"
-        ).all(shopId) as any[];
+        const rows = await sqlAll<any>(
+          "SELECT device_id AS deviceId, name, software, slot, is_main AS isMain, revoked, last_sync_at AS lastSyncAt FROM devices WHERE shop_id = ? ORDER BY slot",
+          shopId
+        );
         return json({ devices: rows.map((r) => ({ ...r, isMain: r.isMain === 1, revoked: r.revoked === 1 })) });
       }
 
@@ -737,9 +775,9 @@ Bun.serve({
         const deviceId = String(body?.deviceId ?? "").trim().slice(0, 64);
         const since = Number(body?.since ?? 0) || 0;
         const shopId = auth.shopId!;
-        const app = checkAppSoftware(shopId, body);
+        const app = await checkAppSoftware(shopId, body);
         if ("error" in app) return bad(app.error, 400);
-        const dev = deviceRow(shopId, deviceId);
+        const dev = await deviceRow(shopId, deviceId);
         if (!dev) return bad("Unknown device — register this device first.", 401);
         if (dev.revoked === 1) return json({ revoked: true, error: "This device was removed by the main device." }, 403);
         const changes = Array.isArray(body?.changes) ? body.changes : [];
@@ -752,20 +790,24 @@ Bun.serve({
           if (!SYNC_TYPE_RE.test(type) || !id || updatedAt <= 0) continue;
           const payload = typeof c?.payload === "string" ? c.payload : JSON.stringify(c?.payload ?? {});
           const deleted = c?.deleted === true || c?.deleted === 1 ? 1 : 0;
-          const cur = sqlite.query(
-            "SELECT updated_at, device_id FROM sync_records WHERE shop_id = ? AND entity_type = ? AND entity_id = ?"
-          ).get(shopId, type, id) as { updated_at: number; device_id: string } | undefined;
+          const cur = await sqlOne<{ updated_at: number; device_id: string }>(
+            "SELECT updated_at, device_id FROM sync_records WHERE shop_id = ? AND entity_type = ? AND entity_id = ?",
+            shopId, type, id
+          );
           if (cur && (cur.updated_at > updatedAt || (cur.updated_at === updatedAt && cur.device_id >= deviceId))) continue;
-          sqlite.query(
+          await sqlRun(
             "INSERT INTO sync_records (shop_id, entity_type, entity_id, payload, updated_at, device_id, deleted) VALUES (?, ?, ?, ?, ?, ?, ?) " +
-            "ON CONFLICT(shop_id, entity_type, entity_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at, device_id = excluded.device_id, deleted = excluded.deleted"
-          ).run(shopId, type, id, payload, updatedAt, deviceId, deleted);
+            "ON CONFLICT(shop_id, entity_type, entity_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at, device_id = excluded.device_id, deleted = excluded.deleted",
+            shopId, type, id, payload, updatedAt, deviceId, deleted
+          );
         }
-        sqlite.query("UPDATE devices SET last_sync_at = ? WHERE shop_id = ? AND device_id = ?").run(now, shopId, deviceId);
-        const pulled = sqlite.query(
-          "SELECT entity_type AS type, entity_id AS id, payload, updated_at AS updatedAt, deleted FROM sync_records WHERE shop_id = ? AND updated_at > ? ORDER BY updated_at ASC"
-        ).all(shopId, since) as any[];
-        const deviceCount = (sqlite.query("SELECT COUNT(*) AS n FROM devices WHERE shop_id = ? AND revoked = 0").get(shopId) as { n: number }).n;
+        await sqlRun("UPDATE devices SET last_sync_at = ? WHERE shop_id = ? AND device_id = ?", now, shopId, deviceId);
+        const pulled = await sqlAll<any>(
+          "SELECT entity_type AS type, entity_id AS id, payload, updated_at AS updatedAt, deleted FROM sync_records WHERE shop_id = ? AND updated_at > ? ORDER BY updated_at ASC",
+          shopId, since
+        );
+        const deviceCountRow = await sqlOne<{ n: number }>("SELECT COUNT(*) AS n FROM devices WHERE shop_id = ? AND revoked = 0", shopId);
+        const deviceCount = deviceCountRow?.n ?? 0;
         return json({
           changes: pulled.map((r) => ({ ...r, deleted: r.deleted === 1, payload: JSON.parse(r.payload || "{}") })),
           serverTime: now,
@@ -773,7 +815,7 @@ Bun.serve({
           isMain: dev.is_main === 1,
           deviceCount,
           software: app.software,
-          epoch: shopEpoch(shopId),
+          epoch: await shopEpoch(shopId),
         });
       }
 
@@ -786,17 +828,17 @@ Bun.serve({
         const body = await readJson(req);
         const callerId = String(body?.callerDeviceId ?? "").trim().slice(0, 64);
         const shopId = auth.shopId!;
-        const caller = deviceRow(shopId, callerId);
+        const caller = await deviceRow(shopId, callerId);
         if (!caller || caller.is_main !== 1 || caller.revoked === 1) {
           return bad("Only the main device can remove devices.", 403);
         }
-        const target = deviceRow(shopId, targetId);
+        const target = await deviceRow(shopId, targetId);
         if (!target) return bad("Device not found.");
         if (target.is_main === 1) {
           return bad("The main device cannot be removed. Assign a new main device first.");
         }
         const revoked = body?.revoked === false ? 0 : 1;
-        sqlite.query("UPDATE devices SET revoked = ? WHERE shop_id = ? AND device_id = ?").run(revoked, shopId, targetId);
+        await sqlRun("UPDATE devices SET revoked = ? WHERE shop_id = ? AND device_id = ?", revoked, shopId, targetId);
         return json({ deviceId: targetId, revoked: revoked === 1 });
       }
 
@@ -805,10 +847,10 @@ Bun.serve({
       if (path.startsWith("/api/devices/") && path.endsWith("/set-main") && req.method === "POST") {
         if (isShop) return bad("Only the CEO can assign the main device.", 403);
         const targetId = decodeURIComponent(path.split("/")[3] ?? "");
-        const target = sqlite.query("SELECT * FROM devices WHERE device_id = ?").get(targetId) as any;
+        const target = await sqlOne<any>("SELECT * FROM devices WHERE device_id = ?", targetId);
         if (!target) return bad("Device not found.");
-        sqlite.query("UPDATE devices SET is_main = 0 WHERE shop_id = ?").run(target.shop_id);
-        sqlite.query("UPDATE devices SET is_main = 1, revoked = 0 WHERE shop_id = ? AND device_id = ?").run(target.shop_id, targetId);
+        await sqlRun("UPDATE devices SET is_main = 0 WHERE shop_id = ?", target.shop_id);
+        await sqlRun("UPDATE devices SET is_main = 1, revoked = 0 WHERE shop_id = ? AND device_id = ?", target.shop_id, targetId);
         return json({ deviceId: targetId, shopId: target.shop_id, isMain: true });
       }
 
@@ -833,4 +875,4 @@ Bun.serve({
   },
 });
 
-console.log(`Viru Empire CEO Panel live on port ${PORT} (DB: ${DB_PATH})`);
+console.log(`Viru Empire CEO Panel live on port ${PORT} (DB: Turso)`);
