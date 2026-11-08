@@ -15,7 +15,11 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 const PORT = 18731;
 const BASE = `http://127.0.0.1:${PORT}`;
-const DB_PATH = `/tmp/viru-panel-test-${process.pid}.db`;
+// Throwaway LOCAL libsql file database for tests — the server's Turso
+// client accepts a file: URL, so the same code path runs here with no
+// network and no real Turso database. Production uses a real Turso URL.
+const TURSO_URL = `file:/tmp/viru-panel-test-${process.pid}.db`;
+const TURSO_FILE = `/tmp/viru-panel-test-${process.pid}.db`;
 const CEO = { username: "testceo", password: "testpass123" };
 
 let proc: ReturnType<typeof Bun.spawn> | null = null;
@@ -80,7 +84,7 @@ beforeAll(async () => {
     env: {
       ...process.env,
       PORT: String(PORT),
-      DB_PATH,
+      TURSO_DATABASE_URL: TURSO_URL,
       CEO_USERNAME: CEO.username,
       CEO_PASSWORD: CEO.password,
       LOGIN_BLOCK_MS: "60000",
@@ -97,9 +101,7 @@ beforeAll(async () => {
 afterAll(async () => {
   proc?.kill();
   await Bun.sleep(200);
-  try { await Bun.file(DB_PATH).delete(); } catch { /* already gone */ }
-  try { await Bun.file(`${DB_PATH}-wal`).delete(); } catch { /* already gone */ }
-  try { await Bun.file(`${DB_PATH}-shm`).delete(); } catch { /* already gone */ }
+  try { await Bun.file(TURSO_FILE).delete(); } catch { /* already gone */ }
 });
 
 describe("fresh panel", () => {
@@ -336,5 +338,32 @@ describe("login rate limit (runs last)", () => {
     }
     const blocked = await call("/api/login", { body: { username: CEO.username, password: "wrong-password" } });
     expect(blocked.status).toBe(429);
+  });
+});
+
+// The server must NEVER start without Turso configured: silently falling
+// back to a local file would look fine and then lose data again the next
+// time the server sleeps. This spawns a second server with the Turso
+// variables stripped and expects it to exit at once with a clear error.
+describe("Turso config is required", () => {
+  test("refuses to start without TURSO_DATABASE_URL", async () => {
+    const env: Record<string, string | undefined> = {
+      ...process.env,
+      PORT: "18799",
+      CEO_USERNAME: "nobody",
+      CEO_PASSWORD: "nobody",
+    };
+    delete env.TURSO_DATABASE_URL;
+    delete env.TURSO_AUTH_TOKEN;
+    const p = Bun.spawn(["bun", "./server.ts"], {
+      cwd: import.meta.dir + "/..",
+      env: env as Record<string, string>,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const code = await p.exited;
+    expect(code).toBe(1);
+    const err = await new Response(p.stderr).text();
+    expect(err).toContain("TURSO_DATABASE_URL");
   });
 });
