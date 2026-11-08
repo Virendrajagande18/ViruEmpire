@@ -109,16 +109,20 @@ Push this folder's contents to it (web-UI upload works if git push is blocked).
 3. When Render asks for env vars, set:
    - `CEO_USERNAME` — the CEO login username the user chose
    - `CEO_PASSWORD` — the CEO login password the user chose
+   - `TURSO_DATABASE_URL` — libSQL URL of the Turso database
+   - `TURSO_AUTH_TOKEN` — auth token for that Turso database
    (Render keeps these secret; they are never written in any file.)
 4. Wait for the deploy to finish. Render gives a URL like
    `https://viru-empire-ceo-panel.onrender.com` — that is the live panel URL.
 
-**Redeploy note:** a redeploy wipes the Render SQLite database. That is what
-clears the old fake demo entries from the live panel — with the seed removed,
-the redeployed panel comes back empty (₹0 everywhere, empty lists) and stays
-empty. Do NOT import a backup downloaded before the cleanup: old backups
-contain the demo shops and payments and would bring them back. Export a fresh
-backup after the redeploy instead.
+**Data note:** all panel data lives in Turso (a hosted database), not in a
+file on the Render server. Shops, keys, payments and devices survive
+sleeps AND redeploys. The panel's Export / Backup (JSON) stays as a
+second safety net — export regularly anyway. The server refuses to start
+if the Turso variables are missing, so a misconfigured deploy fails
+loudly instead of silently losing data. Do NOT import a backup downloaded
+before the 2026-11-08 cleanup: old backups contain the demo shops and
+payments and would bring them back. Export a fresh backup instead.
 
 ## Connect a shop app
 
@@ -134,9 +138,11 @@ oil shop by mistake.
 
 - **Sleeps:** the free service sleeps after ~15 minutes with no traffic.
   The first visit or sync after a sleep takes ~30–60 seconds to wake up.
-- **Data:** the SQLite database file survives sleeps and restarts, but is
-  **wiped on redeploy**. Keep a regular **Export / Backup** (JSON) from the
-  panel and re-import it if a redeploy ever clears the data.
+  The panel shows a clear loading state and retries a failed first load
+  once, so a wake-up never looks like lost data.
+- **Data:** everything lives in Turso, so sleeps and redeploys no longer
+  wipe anything. Keep a regular **Export / Backup** (JSON) from the
+  panel as a second safety net.
 - **No card** is needed for Render's free tier.
 
 ## Local test
@@ -148,10 +154,11 @@ bun ./server.ts          # serves on http://localhost:3000
 
 With env vars, the server creates the CEO account on first run:
 ```sh
-CEO_USERNAME=viru CEO_PASSWORD='...' bun ./server.ts
+CEO_USERNAME=viru CEO_PASSWORD='...' TURSO_DATABASE_URL='file:/tmp/test.db' bun ./server.ts
 ```
 
-Use a throwaway DB for tests: `DB_PATH=/tmp/test.db bun ./server.ts`.
+Use a throwaway local database for tests: `TURSO_DATABASE_URL='file:/tmp/test.db' bun ./server.ts`.
+Without TURSO_DATABASE_URL the server exits at once with a clear error.
 
 ## Verified 2026-11-08 (local, fresh empty DB)
 
