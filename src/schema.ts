@@ -159,10 +159,11 @@ export const syncRecords = sqliteTable("sync_records", {
 });
 
 // sync_meta: one row per shop. epoch is a random id made when the shop's
-// first device registers; it changes only when the server database is
-// wiped (redeploy). A device that sees a different epoch than the one it
-// last synced with knows the server is fresh and re-pushes its full
-// local dataset — that is how shop data comes back after a wipe.
+// first device registers; it changes only if the Turso database is ever
+// reset — sleeps and redeploys no longer wipe it. A device that sees a
+// different epoch than the one it last synced with knows the server is
+// fresh and re-pushes its full local dataset — that is how shop data
+// comes back after a wipe.
 export const syncMeta = sqliteTable("sync_meta", {
   shopId: integer("shop_id").primaryKey(),
   epoch: text("epoch").notNull(),
