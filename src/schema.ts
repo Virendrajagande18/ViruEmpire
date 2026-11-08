@@ -115,3 +115,49 @@ export const payments = sqliteTable("payments", {
     .notNull()
     .$defaultFn(() => new Date()),
 });
+
+// devices: the laundry app's phones/tablets, up to 3 per shop.
+// One shop token is shared by the shop's devices, so a device is told
+// apart by its own device_id (a UUID the app makes at first setup and
+// stores on the phone — never in a backup). The FIRST device registered
+// for a shop is the main device (slot 1); it alone can remove other
+// devices. A revoked device stops syncing and goes view-only.
+export const devices = sqliteTable("devices", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  shopId: integer("shop_id").notNull(),
+  deviceId: text("device_id").notNull(),
+  name: text("name").notNull().default(""),
+  slot: integer("slot").notNull().default(1),
+  isMain: integer("is_main").notNull().default(0),
+  revoked: integer("revoked").notNull().default(0),
+  lastSyncAt: integer("last_sync_at", { mode: "timestamp_ms" }),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// sync_records: the shop's shared dataset, one row per entity per shop
+// (the latest version — not a history). entity_type is order, customer,
+// payment, rate or setting; entity_id is the app's sync_id (UUID);
+// payload is the entity JSON; updated_at decides last-write-wins;
+// deleted=1 is a tombstone so a delete propagates to other devices.
+export const syncRecords = sqliteTable("sync_records", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  shopId: integer("shop_id").notNull(),
+  entityType: text("entity_type").notNull(),
+  entityId: text("entity_id").notNull(),
+  payload: text("payload").notNull().default("{}"),
+  updatedAt: integer("updated_at").notNull().default(0),
+  deviceId: text("device_id").notNull().default(""),
+  deleted: integer("deleted").notNull().default(0),
+});
+
+// sync_meta: one row per shop. epoch is a random id made when the shop's
+// first device registers; it changes only when the server database is
+// wiped (redeploy). A device that sees a different epoch than the one it
+// last synced with knows the server is fresh and re-pushes its full
+// local dataset — that is how shop data comes back after a wipe.
+export const syncMeta = sqliteTable("sync_meta", {
+  shopId: integer("shop_id").primaryKey(),
+  epoch: text("epoch").notNull(),
+});
