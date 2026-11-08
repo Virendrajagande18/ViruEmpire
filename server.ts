@@ -4,8 +4,10 @@
 //  - POST /actions  {action, args} -> {data} | {error}   (the panel web UI)
 //    CEO session tokens ONLY — a shop token is rejected here, so the
 //    phone's token can never call revealKey / exportBackup / generateKey.
-//  - REST /api/* for the Trimurti Laundry app sync client:
+//  - REST /api/* for shop-app sync clients (any Viru Empire software —
+//    laundry, oil dealership, LIC & Star Health office, fataka stall):
 //      POST /api/login    {username, password} -> {token, username}
+//      GET  /api/products -> {products}  (public catalogue, no auth)
 //      POST /api/shop-token {shopName, shopPhone} | {shopId} -> {token, shopId}
 //                           {shopId, revoke: true} -> {revoked}
 //                           CEO only. Mints a SHOP-SCOPED token: the phone
@@ -44,6 +46,7 @@ import { drizzle } from "drizzle-orm/bun-sqlite";
 import { eq } from "drizzle-orm";
 import { Actions } from "./src/actions";
 import * as schema from "./src/schema";
+import { normalizeSoftware, PRODUCTS } from "./src/products";
 import { privilegedHandlers } from "./src/privileged";
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -117,6 +120,7 @@ CREATE TABLE IF NOT EXISTS devices (
   shop_id INTEGER NOT NULL,
   device_id TEXT NOT NULL,
   name TEXT NOT NULL DEFAULT '',
+  software TEXT NOT NULL DEFAULT '',
   slot INTEGER NOT NULL DEFAULT 1,
   is_main INTEGER NOT NULL DEFAULT 0,
   revoked INTEGER NOT NULL DEFAULT 0,
@@ -142,6 +146,13 @@ CREATE TABLE IF NOT EXISTS sync_meta (
 );
 `;
 sqlite.exec(CREATE_TABLES);
+
+// Additive migration for databases created before devices carried a
+// software name: add the column when it is missing, leave data alone.
+const deviceCols = sqlite.query("PRAGMA table_info(devices)").all() as { name: string }[];
+if (!deviceCols.some((c) => c.name === "software")) {
+  sqlite.exec("ALTER TABLE devices ADD COLUMN software TEXT NOT NULL DEFAULT ''");
+}
 
 // First-run CEO account from environment variables (set in the Render
 // dashboard, never in a file): if no account exists yet, create the one
@@ -334,13 +345,10 @@ function normalizeMethod(m: unknown): "upi" | "cash" | "card" | "bank" | "other"
   return "upi";
 }
 
-// The laundry app sends software as "Laundry" — that is the panel's
-// "Laundry Management System" product, so map it to the full name.
-function mapSoftware(s: unknown): string {
-  const v = String(s ?? "").trim();
-  if (v.toLowerCase() === "laundry") return "Laundry Management System";
-  return v;
-}
+// Product names are normalized through src/products.ts — the one place
+// that defines the products. An app may send a short alias ("Laundry");
+// the panel stores the canonical name ("Laundry Management System").
+// Unknown names pass through unchanged ("Other" software).
 
 function normalizeDate(v: unknown): string {
   if (typeof v === "number" && Number.isFinite(v) && v > 0) {
@@ -413,8 +421,14 @@ Bun.serve({
       return json(result);
     }
 
-    // ---- REST API for the laundry app ----
+    // ---- REST API for shop apps (any Viru Empire software) ----
     if (path.startsWith("/api/")) {
+      // Public product catalogue — the client fetches this so a new
+      // product appears in every dropdown and filter with no client
+      // rebuild. Product names are not sensitive.
+      if (path === "/api/products" && req.method === "GET") {
+        return json({ products: [...PRODUCTS] });
+      }
       if (path === "/api/login" && req.method === "POST") {
         const body = await readJson(req);
         const ip = clientIp(req);
@@ -459,7 +473,9 @@ Bun.serve({
               .insert(schema.shops)
               .values({
                 name, ownerName: "", phone, city: "",
-                software: "Laundry Management System", status: "active",
+                // The caller's software, normalized — never a hardcoded
+                // product. A shop created without one stays unspecified.
+                software: normalizeSoftware(body?.software ?? ""), status: "active",
                 notes: "Added by CEO for shop-token setup.",
               })
               .returning({ id: schema.shops.id });
@@ -519,7 +535,7 @@ Bun.serve({
             token, id: match.id, name,
             ownerName: String(body?.ownerName ?? match.ownerName ?? ""),
             phone, city: String(body?.city ?? match.city ?? ""),
-            software: mapSoftware(body?.software ?? match.software ?? ""),
+            software: normalizeSoftware(body?.software ?? match.software ?? ""),
             status: body?.status ?? match.status,
             notes: match.notes ?? "", joinedAt: "",
           });
@@ -530,7 +546,7 @@ Bun.serve({
           token, name,
           ownerName: String(body?.ownerName ?? ""),
           phone, city: String(body?.city ?? ""),
-          software: mapSoftware(body?.software ?? ""),
+          software: normalizeSoftware(body?.software ?? ""),
           status: body?.status ?? "active",
           notes: "", joinedAt: "",
         });
@@ -606,14 +622,24 @@ Bun.serve({
         if (r.error) return bad(r.error, 400);
         return json(r.data);
       }
-      // ---- Multi-device sync (LaundryX v1.1.5) ----
+      // ---- Multi-device sync (any shop app) ----
       // The shop's devices share ONE shop token, so a device is told
       // apart by its own deviceId (a UUID the app makes at first setup
       // and stores on the phone — never in a backup). Every call below
       // is shop-scoped: a token can only touch its own shop's devices
       // and data. Licence/token endpoints above are untouched.
+      // Devices and sync are product-agnostic: the shop's software
+      // (from its shop row) is the source of truth for which app a
+      // device runs, and sync accepts any record kind — laundry syncs
+      // order/customer/payment/rate/setting, an LIC office syncs
+      // policy/customer/payment/..., an oil dealership syncs
+      // stock/scheme/... The server stores the payload as-is and never
+      // requires laundry fields.
       const MAX_DEVICES = 3;
-      const SYNC_TYPES = ["order", "customer", "payment", "rate", "setting"];
+      // Entity types are NOT a fixed list: every product syncs its own
+      // kinds of records. Only the SHAPE is checked — a short lowercase
+      // slug — so a new product never needs a server change to sync.
+      const SYNC_TYPE_RE = /^[a-z][a-z0-9_-]{0,31}$/;
       function shopEpoch(shopId: number): string {
         const row = sqlite.query("SELECT epoch FROM sync_meta WHERE shop_id = ?").get(shopId) as { epoch: string } | undefined;
         if (row) return row.epoch;
@@ -623,6 +649,22 @@ Bun.serve({
       }
       function deviceRow(shopId: number, deviceId: string): any {
         return sqlite.query("SELECT * FROM devices WHERE shop_id = ? AND device_id = ?").get(shopId, deviceId);
+      }
+      function shopSoftwareOf(shopId: number): string {
+        const row = sqlite.query("SELECT software FROM shops WHERE id = ?").get(shopId) as { software: string } | undefined;
+        return normalizeSoftware(row?.software ?? "");
+      }
+      // The app may announce which product it is (software / app). When
+      // the shop already has a product set, the announced one must match
+      // it — a laundry app must never register against an oil shop.
+      // Returns the shop's software (the source of truth) or an error.
+      function checkAppSoftware(shopId: number, body: any): { software: string } | { error: string } {
+        const shopSoftware = shopSoftwareOf(shopId);
+        const announced = normalizeSoftware(body?.software ?? body?.app ?? body?.appType ?? "");
+        if (announced && shopSoftware && announced !== shopSoftware) {
+          return { error: `This shop runs ${shopSoftware}, not ${announced}.` };
+        }
+        return { software: shopSoftware };
       }
 
       // Register a device for the shop. First device = main (slot 1).
@@ -634,9 +676,11 @@ Bun.serve({
         const name = String(body?.deviceName ?? "").trim().slice(0, 80);
         if (!deviceId) return bad("deviceId is required.");
         const shopId = auth.shopId!;
+        const app = checkAppSoftware(shopId, body);
+        if ("error" in app) return bad(app.error, 400);
         const existing = deviceRow(shopId, deviceId);
         if (existing) {
-          return json({ deviceId, slot: existing.slot, isMain: existing.is_main === 1, revoked: existing.revoked === 1, epoch: shopEpoch(shopId) });
+          return json({ deviceId, slot: existing.slot, isMain: existing.is_main === 1, revoked: existing.revoked === 1, software: app.software, epoch: shopEpoch(shopId) });
         }
         // The cap counts ACTIVE devices only: a revoked device frees
         // its slot, so a replacement phone can join after the old one
@@ -650,9 +694,9 @@ Bun.serve({
         const slot = slotRow.m + 1;
         const isMain = countRow.n === 0 ? 1 : 0;
         sqlite.query(
-          "INSERT INTO devices (shop_id, device_id, name, slot, is_main, revoked, created_at) VALUES (?, ?, ?, ?, ?, 0, ?)"
-        ).run(shopId, deviceId, name, slot, isMain, Date.now());
-        return json({ deviceId, slot, isMain: isMain === 1, revoked: false, epoch: shopEpoch(shopId) });
+          "INSERT INTO devices (shop_id, device_id, name, software, slot, is_main, revoked, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?)"
+        ).run(shopId, deviceId, name, app.software, slot, isMain, Date.now());
+        return json({ deviceId, slot, isMain: isMain === 1, revoked: false, software: app.software, epoch: shopEpoch(shopId) });
       }
 
       // List the shop's devices (for the main device's Settings screen).
@@ -660,7 +704,7 @@ Bun.serve({
         if (!isShop) return bad("Only a shop device can list devices.", 403);
         const shopId = auth.shopId!;
         const rows = sqlite.query(
-          "SELECT device_id AS deviceId, name, slot, is_main AS isMain, revoked, last_sync_at AS lastSyncAt FROM devices WHERE shop_id = ? ORDER BY slot"
+          "SELECT device_id AS deviceId, name, software, slot, is_main AS isMain, revoked, last_sync_at AS lastSyncAt FROM devices WHERE shop_id = ? ORDER BY slot"
         ).all(shopId) as any[];
         return json({ devices: rows.map((r) => ({ ...r, isMain: r.isMain === 1, revoked: r.revoked === 1 })) });
       }
@@ -674,7 +718,7 @@ Bun.serve({
         const shopId = Number(path.split("/")[3] ?? "");
         if (!shopId) return bad("Shop id is required.");
         const rows = sqlite.query(
-          "SELECT device_id AS deviceId, name, slot, is_main AS isMain, revoked, last_sync_at AS lastSyncAt FROM devices WHERE shop_id = ? ORDER BY slot"
+          "SELECT device_id AS deviceId, name, software, slot, is_main AS isMain, revoked, last_sync_at AS lastSyncAt FROM devices WHERE shop_id = ? ORDER BY slot"
         ).all(shopId) as any[];
         return json({ devices: rows.map((r) => ({ ...r, isMain: r.isMain === 1, revoked: r.revoked === 1 })) });
       }
@@ -684,12 +728,17 @@ Bun.serve({
       // Last-write-wins by updatedAt per entity; a tie keeps the higher
       // deviceId so every device agrees. Payments are separate records,
       // so two payments on one order never overwrite each other.
+      // `type` is the app's own record kind — any product's kinds work
+      // (laundry: order/customer/payment/rate/setting; an LIC office:
+      // policy/customer/payment/...). The payload is stored as-is.
       if (path === "/api/sync" && req.method === "POST") {
         if (!isShop) return bad("Only a shop device can sync data.", 403);
         const body = await readJson(req);
         const deviceId = String(body?.deviceId ?? "").trim().slice(0, 64);
         const since = Number(body?.since ?? 0) || 0;
         const shopId = auth.shopId!;
+        const app = checkAppSoftware(shopId, body);
+        if ("error" in app) return bad(app.error, 400);
         const dev = deviceRow(shopId, deviceId);
         if (!dev) return bad("Unknown device — register this device first.", 401);
         if (dev.revoked === 1) return json({ revoked: true, error: "This device was removed by the main device." }, 403);
@@ -700,7 +749,7 @@ Bun.serve({
           const type = String(c?.type ?? "");
           const id = String(c?.id ?? "").trim().slice(0, 128);
           const updatedAt = Number(c?.updatedAt ?? 0) || 0;
-          if (!SYNC_TYPES.includes(type) || !id || updatedAt <= 0) continue;
+          if (!SYNC_TYPE_RE.test(type) || !id || updatedAt <= 0) continue;
           const payload = typeof c?.payload === "string" ? c.payload : JSON.stringify(c?.payload ?? {});
           const deleted = c?.deleted === true || c?.deleted === 1 ? 1 : 0;
           const cur = sqlite.query(
@@ -723,6 +772,7 @@ Bun.serve({
           revoked: false,
           isMain: dev.is_main === 1,
           deviceCount,
+          software: app.software,
           epoch: shopEpoch(shopId),
         });
       }

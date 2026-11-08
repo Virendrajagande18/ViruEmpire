@@ -11,15 +11,61 @@ payment anywhere in the code, the database, or the UI. A fresh panel shows
 ## What is in this folder
 
 - `server.ts` — Bun server. Serves the panel UI, `POST /actions` (the panel),
-  and REST `/api/*` (the laundry app): `login`, `shops`, `keys`, `payments`,
-  `dashboard`, `export`, `import`, `shop-token`.
+  and REST `/api/*` (shop apps — laundry, oil dealership, LIC & Star Health
+  office, fataka stall): `login`, `products`, `shops`, `keys`, `payments`,
+  `dashboard`, `export`, `import`, `shop-token`, `devices`, `sync`.
 - `src/` — the panel's real logic, copied from the space: `schema.ts`,
   `actions.ts` (all actions incl. change password, suspend/resume software,
   edit payment, import backup, clear-all, activity log), `privileged.ts`,
   plus `sdk-shim.ts` (a tiny local stand-in for the Hatch SDK, used only here).
+- `src/products.ts` — **the one place that defines the products** (the 4
+  canonical names + short aliases an app may send). Business logic never
+  hardcodes a product list; the client fetches it from `GET /api/products`.
+- `tests/panel.test.ts` — bun tests (fresh DB stays empty, one shop per
+  product, per-product totals, keys for every product, Oil devices, LIC
+  sync with non-laundry record kinds, laundry regression, rate limit).
+  Run: `bun test tests/panel.test.ts`
 - `client-dist/` — the prebuilt panel client (built by `build-client.mjs`).
 - `Dockerfile`, `render.yaml` — Render free-tier deploy.
 - `build-client.mjs` — rebuilds the client from the space source after UI edits.
+
+## Products — all four are first-class
+
+The panel sells four software products: **Laundry Management System, Oil
+Dealership Software, LIC & Star Health Office System, Fataka Stall
+Website**. Every feature works the same for all four — shops, licence keys,
+payments, devices, sync, per-product dashboard totals, and the activity
+log (which names the product on every entry, e.g. "Generated licence key
+… for Test Fataka Stall (Fataka Stall Website)").
+
+- **Devices + sync are product-agnostic.** A device registers with the
+  shop's product (the shop's software field is the source of truth; a
+  device announcing the wrong product is rejected with 400). Sync accepts
+  any record kind — laundry syncs order/customer/payment/rate/setting, an
+  LIC office syncs policy/customer/payment/…, an oil dealership syncs
+  stock/scheme/… — only the shape (a short lowercase slug) is checked.
+  Rules unchanged: up to 3 active devices per shop, first = main, only
+  the main can revoke, revoked = view-only, one licence covers the shop.
+- **Adding a 5th product** = one line in `src/products.ts` (add the full
+  name to `PRODUCTS`, plus any short alias to `ALIASES`), then deploy —
+  about 5 minutes. The client fetches `GET /api/products`, so the
+  dropdowns, filters, dashboard cards and Devices lists pick the new
+  product up with **no client rebuild**. A shop can also carry any custom
+  software name ("Other" in the UI) — unknown names pass through
+  unchanged, so a new product never breaks existing shops.
+
+## Cinematic startup intro (panel only, NOT the laundry app)
+
+On every page load the panel shows a ~**1.2-second** Viru Empire logo
+reveal before the login screen (or dashboard): dark cinematic backdrop, a
+blue V mark and "VIRU EMPIRE / CEO PANEL" fading and scaling in with a
+soft glow, a gold line sweeping under, then the overlay fades out. Tap or
+click anywhere skips it at once. The login screen and dashboard mount
+underneath immediately, so it never delays anything; it plays once per
+page load, never on in-app navigation. Pure CSS/JS, no new libraries, no
+sound, no extra network load. It works in all three themes (the overlay
+is dark on purpose) and on mobile, and it is skipped entirely when the
+user prefers reduced motion.
 
 ## Panel features
 
@@ -74,12 +120,15 @@ empty. Do NOT import a backup downloaded before the cleanup: old backups
 contain the demo shops and payments and would bring them back. Export a fresh
 backup after the redeploy instead.
 
-## Connect the laundry app
+## Connect a shop app
 
-In the Trimurti Laundry app → Settings → Viru Empire CEO Panel, enter:
+In any Viru Empire shop app (laundry, oil, LIC office, fataka…) → Settings → Viru Empire CEO Panel, enter:
 - **Server URL:** the Render URL above (e.g. `https://viru-empire-ceo-panel.onrender.com`)
 - **CEO panel username / password:** the same login
-- Tap **Save & Sync Now**. The shop and its payments then sync to the panel.
+- Tap **Save & Sync Now**. The shop and its data then sync to the panel.
+The app announces its product when it registers/syncs; the panel checks
+it against the shop's product, so a laundry app can never sync into an
+oil shop by mistake.
 
 ## Free-tier limits (honest)
 
@@ -127,3 +176,18 @@ Use a throwaway DB for tests: `DB_PATH=/tmp/test.db bun ./server.ts`.
   No demo name, amount or seed function remains in the code or the built
   bundle (checked: all 6 demo shops, all demo amounts incl. ₹4,82,937 /
   ₹77,981 / ₹4,999, and `seedIfEmpty` — zero matches).
+
+## Verified 2026-11-08 (multi-product optimization, this change)
+
+- `bun test tests/panel.test.ts` — **13 tests, 96 assertions, all pass**
+  (fresh DB empty; 4 products from `GET /api/products`; one shop per
+  product with alias normalization; per-product dashboard totals; Fataka
+  key generate/checksum/revoke/renew; keys for laundry/oil/LIC; Oil
+  devices register ×3 + cap + revoke-frees-slot + wrong-software 400;
+  LIC sync with `policy`/`customer` kinds + bad type skipped + wrong
+  software 400; laundry sync regression; devices list + CEO set-main for
+  any shop; shop token rejected by `/actions`; activity log names the
+  product; 5 bad logins → 429).
+- Client typecheck clean (`tsc --noEmit`, 0 errors); server bundles
+  (`bun build ./server.ts`, 195 modules); client rebuilt
+  (`bun ./build-client.mjs` — new `client-dist` assets).
