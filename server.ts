@@ -50,6 +50,7 @@ import { eq } from "drizzle-orm";
 import { Actions } from "./src/actions";
 import * as schema from "./src/schema";
 import { normalizeSoftware, PRODUCTS } from "./src/products";
+import { canonicalPhone } from "./src/phone";
 import { privilegedHandlers } from "./src/privileged";
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -496,7 +497,13 @@ Bun.serve({
           const phone = String(body?.shopPhone ?? "").trim();
           if (!name) return bad("Shop name is required.");
           const rows = await db.select().from(schema.shops);
-          const match = rows.find((s) => s.name === name && s.phone === phone)
+          // The PHONE is the shop's identity (v1.1.16): a renamed shop
+          // (new name, same phone) is the same shop — matching by name
+          // first used to create a duplicate row with the same phone.
+          // Name is only a fallback when no phone was sent.
+          const canon = canonicalPhone(phone);
+          const match = (canon ? rows.find((s) => canonicalPhone(s.phone) === canon) : undefined)
+            ?? rows.find((s) => s.name === name && s.phone === phone)
             ?? rows.find((s) => s.name === name);
           if (match) {
             shopId = match.id;
@@ -553,18 +560,21 @@ Bun.serve({
       }
       if (path === "/api/shops" && req.method === "POST") {
         const body = await readJson(req);
+        if (isShop) {
+          // A shop token IS the shop's identity (v1.1.16): the phone is
+          // identified by its token, never by the name it sends.
+          // Renaming the shop in the app must never break sync, create
+          // a duplicate shop, or rename the panel row — so a shop token
+          // only confirms its own row exists and changes nothing.
+          const own = await db.select().from(schema.shops).where(eq(schema.shops.id, auth.shopId)).limit(1);
+          if (!own[0]) return bad("This phone can only sync its own shop.", 403);
+          return json({ id: own[0].id, updated: false });
+        }
         const name = String(body?.name ?? "").trim();
         if (!name) return bad("Shop name is required.");
         const phone = String(body?.phone ?? "").trim();
         const existing = await db.select().from(schema.shops);
         const match = existing.find((s) => s.name === name && s.phone === phone);
-        if (isShop) {
-          // A shop token may only update its OWN row (same name + phone);
-          // it can never create a shop or touch another shop.
-          if (!match || match.id !== auth.shopId) {
-            return bad("This phone can only sync its own shop.", 403);
-          }
-        }
         if (match) {
           const r = await callAction("updateShop", {
             token, id: match.id, name,
@@ -620,17 +630,14 @@ Bun.serve({
         }
         let shopId: number | null;
         if (isShop) {
-          // No auto-create for a shop token: the payment must belong to
-          // its own shop, resolved by id or by its own name.
-          if (typeof body?.shopId === "number" && body.shopId === auth.shopId) {
-            shopId = auth.shopId;
-          } else if (typeof body?.shopId === "string" && body.shopId.trim()) {
-            const rows = await db.select().from(schema.shops).where(eq(schema.shops.name, body.shopId.trim())).limit(1);
-            shopId = rows[0]?.id === auth.shopId ? auth.shopId : null;
-          } else {
-            shopId = auth.shopId;
-          }
-          if (!shopId) return bad("This phone can only record payments for its own shop.", 403);
+          // The shop token IS the shop's identity (v1.1.16): a payment
+          // recorded on this phone always belongs to the token's shop.
+          // The string shop id the app sends is the shop's PHONE (new
+          // clients) or its NAME (old clients) — either way it can only
+          // ever resolve to the own shop, and a renamed shop must never
+          // fail a payment sync, so the token decides and the string is
+          // never used to pick a shop.
+          shopId = auth.shopId;
         } else {
           shopId = await resolveShopId(body?.shopId);
         }
@@ -715,6 +722,13 @@ Bun.serve({
         if ("error" in app) return bad(app.error, 400);
         const existing = await deviceRow(shopId, deviceId);
         if (existing) {
+          // Re-registering updates the stored name (v1.1.16): a row
+          // stored blank — or stored before the name field existed —
+          // fills in from the phone's current model name. The name is
+          // only ever written from the phone itself, never blanked.
+          if (name && name !== existing.name) {
+            await sqlRun("UPDATE devices SET name = ? WHERE shop_id = ? AND device_id = ?", name, shopId, deviceId);
+          }
           return json({ deviceId, slot: existing.slot, isMain: existing.is_main === 1, revoked: existing.revoked === 1, software: app.software, epoch: await shopEpoch(shopId) });
         }
         // The cap counts ACTIVE devices only: a revoked device frees
@@ -780,6 +794,14 @@ Bun.serve({
         const dev = await deviceRow(shopId, deviceId);
         if (!dev) return bad("Unknown device — register this device first.", 401);
         if (dev.revoked === 1) return json({ revoked: true, error: "This device was removed by the main device." }, 403);
+        // The phone sends its name on every sync (v1.1.16): keep the
+        // stored name fresh, and fill in rows that were stored blank.
+        // Never blanked: an empty name in the request leaves the
+        // stored name alone.
+        const syncName = String(body?.deviceName ?? "").trim().slice(0, 80);
+        if (syncName && syncName !== dev.name) {
+          await sqlRun("UPDATE devices SET name = ? WHERE shop_id = ? AND device_id = ?", syncName, shopId, deviceId);
+        }
         const changes = Array.isArray(body?.changes) ? body.changes : [];
         if (changes.length > 500) return bad("Too many changes in one sync (max 500).");
         const now = Date.now();
