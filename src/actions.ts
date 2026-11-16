@@ -9,6 +9,7 @@
 
 import { defineAction, z, type ActionsModule, type Ctx } from "./sdk-shim.ts";
 import { privileged } from "./privileged.ts";
+import { canonicalPhone } from "./phone.ts";
 import { desc, eq } from "drizzle-orm";
 import * as schema from "./schema";
 
@@ -1194,7 +1195,7 @@ export const Actions = {
   }),
 
   importBackup: defineAction({
-    description: "Restores a panel backup file (the JSON from Export / Backup). Shops are matched by name + phone, keys by their code, and payments are skipped when an identical record already exists — re-importing the same backup never duplicates anything.",
+    description: "Restores a panel backup file (the JSON from Export / Backup). Shops are matched by name + phone, keys by their code, and payments are skipped when an identical record already exists — re-importing the same backup never duplicates anything. Keys and payments resolve their shop by the backup shop row's phone (name as fallback), so a shop renamed in the live panel still links its keys and payments.",
     request: z.object({
       ...tokenReq,
       backup: z.object({
@@ -1255,11 +1256,45 @@ export const Actions = {
       for (const s of existingShops) {
         if (!shopNameToId.has(s.name)) shopNameToId.set(s.name, s.id);
       }
+      // Phone-first resolution (v1.1.16): the phone number is the
+      // shop's identity — a key or payment whose shop was renamed in
+      // the live panel still links to the right shop through the
+      // backup shop row's phone. Name is only a fallback.
+      const shopPhoneToId = new Map<string, number>();
+      for (const s of existingShops) {
+        const canon = canonicalPhone(s.phone);
+        if (canon && !shopPhoneToId.has(canon)) shopPhoneToId.set(canon, s.id);
+      }
+      const backupShopPhoneByName = new Map<string, string>();
+      for (const s of b.shops) {
+        if (!backupShopPhoneByName.has(s.name)) backupShopPhoneByName.set(s.name, s.phone ?? "");
+      }
+      const resolveBackupShopId = (shopName: string | null | undefined): number | null => {
+        if (!shopName) return null;
+        const bkPhone = backupShopPhoneByName.get(shopName);
+        if (bkPhone) {
+          const live = shopPhoneToId.get(canonicalPhone(bkPhone));
+          if (live !== undefined) return live;
+        }
+        return shopNameToId.get(shopName) ?? null;
+      };
       const validStatus = (v: string): "active" | "trial" | "suspended" | "closed" =>
         v === "trial" || v === "suspended" || v === "closed" ? v : "active";
       for (const s of b.shops) {
         const key = `${s.name}|||${s.phone}`;
         if (shopIdByKey.has(key)) { skipped += 1; continue; }
+        // Same phone, renamed shop (v1.1.16): the phone is the shop's
+        // identity, so a live row with this phone IS this shop — never
+        // create a duplicate row for it under the backup's old name.
+        // The live name wins; the backup name still resolves to the
+        // live row for the keys and payments below.
+        const canonPhone = canonicalPhone(s.phone ?? "");
+        const phoneMatch = canonPhone ? shopPhoneToId.get(canonPhone) : undefined;
+        if (phoneMatch !== undefined) {
+          shopNameToId.set(s.name, phoneMatch);
+          skipped += 1;
+          continue;
+        }
         const joined = s.joinedAt ? new Date(s.joinedAt) : new Date();
         const [row] = await db
           .insert(schema.shops)
@@ -1273,6 +1308,7 @@ export const Actions = {
         if (row) {
           shopIdByKey.set(key, row.id);
           if (!shopNameToId.has(s.name)) shopNameToId.set(s.name, row.id);
+          if (canonPhone && !shopPhoneToId.has(canonPhone)) shopPhoneToId.set(canonPhone, row.id);
           importedShops += 1;
         }
       }
@@ -1286,8 +1322,10 @@ export const Actions = {
       const knownCodes = new Set(existingKeys.map((k) => k.keyCode));
       for (const k of b.licenseKeys) {
         if (knownCodes.has(k.keyCode)) { skipped += 1; continue; }
-        // The backup's shopId refers to the old database — resolve by shop name instead.
-        const shopId = k.shopName ? (shopNameToId.get(k.shopName) ?? null) : null;
+        // The backup's shopId refers to the old database — resolve by
+        // the backup shop row's phone (name as fallback), so a renamed
+        // shop still gets its keys.
+        const shopId = resolveBackupShopId(k.shopName);
         const expires = k.expiresAt ? new Date(k.expiresAt) : null;
         await db.insert(schema.licenseKeys).values({
           keyCode: k.keyCode,
@@ -1312,7 +1350,7 @@ export const Actions = {
         existingPays.map((p) => payKey(p.shopId, p.amountInr, p.method, p.status, p.note, p.paidAt.getTime())),
       );
       for (const p of b.payments) {
-        const shopId = p.shopName ? (shopNameToId.get(p.shopName) ?? null) : null;
+        const shopId = resolveBackupShopId(p.shopName);
         const paid = p.paidAt ? new Date(p.paidAt) : new Date();
         const paidMs = Number.isNaN(paid.getTime()) ? Date.now() : paid.getTime();
         const key = payKey(shopId, p.amountInr, validMethod(p.method ?? "upi"), validPayStatus(p.status ?? "received"), p.note ?? "", paidMs);
