@@ -177,7 +177,11 @@ CREATE TABLE IF NOT EXISTS sync_records (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_records_shop_entity ON sync_records (shop_id, entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_sync_records_updated ON sync_records (shop_id, updated_at);
-CREATE INDEX IF NOT EXISTS idx_sync_records_seq ON sync_records (shop_id, seq);
+-- NOTE: idx_sync_records_seq is NOT created here. On the live database the
+-- sync_records table already exists WITHOUT the seq column, so creating
+-- this index here (before the ALTER TABLE migration below) crashes the
+-- server at startup with "no such column: seq". It is created after the
+-- migration instead (see below).
 CREATE TABLE IF NOT EXISTS sync_meta (
   shop_id INTEGER PRIMARY KEY,
   epoch TEXT NOT NULL,
