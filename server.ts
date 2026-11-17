@@ -168,13 +168,21 @@ CREATE TABLE IF NOT EXISTS sync_records (
   payload TEXT NOT NULL DEFAULT '{}',
   updated_at INTEGER NOT NULL DEFAULT 0,
   device_id TEXT NOT NULL DEFAULT '',
-  deleted INTEGER NOT NULL DEFAULT 0
+  deleted INTEGER NOT NULL DEFAULT 0,
+  -- v1.1.19: server-side receipt order. The pull cursor is this, not
+  -- updated_at — a timestamp cursor across two clocks silently drops
+  -- offline changes (a phone behind the server stamps below the
+  -- cursor). One counter per shop, handed out in push order.
+  seq INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sync_records_shop_entity ON sync_records (shop_id, entity_type, entity_id);
 CREATE INDEX IF NOT EXISTS idx_sync_records_updated ON sync_records (shop_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_sync_records_seq ON sync_records (shop_id, seq);
 CREATE TABLE IF NOT EXISTS sync_meta (
   shop_id INTEGER PRIMARY KEY,
-  epoch TEXT NOT NULL
+  epoch TEXT NOT NULL,
+  -- v1.1.19: next receipt-sequence number for this shop (see seq).
+  seq INTEGER NOT NULL DEFAULT 0
 );
 `;
 await turso.executeMultiple(CREATE_TABLES);
@@ -184,6 +192,21 @@ await turso.executeMultiple(CREATE_TABLES);
 // column. (The old local SQLite files — the only databases that could
 // lack the column — are abandoned with this move; their data is gone
 // with the wiped files, which is exactly the bug being fixed.)
+//
+// v1.1.19: the sync_records.seq / sync_meta.seq columns ARE migrated,
+// because the live Turso database already has sync rows without them.
+// Old rows take their row id as seq (insertion order = receipt order);
+// the per-shop counter starts above the highest row seq, so a new push
+// can never reuse a seq a phone already passed.
+try {
+  await turso.execute({ sql: "ALTER TABLE sync_records ADD COLUMN seq INTEGER NOT NULL DEFAULT 0", args: [] });
+} catch { /* already there */ }
+try {
+  await turso.execute({ sql: "ALTER TABLE sync_meta ADD COLUMN seq INTEGER NOT NULL DEFAULT 0", args: [] });
+} catch { /* already there */ }
+await turso.execute({ sql: "UPDATE sync_records SET seq = id WHERE seq = 0", args: [] });
+await turso.execute({ sql: "UPDATE sync_meta SET seq = MAX(seq, (SELECT COALESCE(MAX(seq), 0) FROM sync_records WHERE sync_records.shop_id = sync_meta.shop_id))", args: [] });
+await turso.execute({ sql: "CREATE INDEX IF NOT EXISTS idx_sync_records_seq ON sync_records (shop_id, seq)", args: [] });
 
 // First-run CEO account from environment variables (set in the Render
 // dashboard, never in a file): if no account exists yet, create the one
@@ -430,6 +453,12 @@ Bun.serve({
     }
 
     if (path === "/health") return json({ ok: true });
+
+    // v1.1.19: keep-alive ping for the shop app. Same as /health — no
+    // database hit, just "awake" — so the app can keep the free Render
+    // service warm while the shop uses it, without waking the database.
+    // Public on purpose: waking the server needs no shop data.
+    if (path === "/ping") return json({ ok: true, time: Date.now() });
 
     // ---- panel web UI: POST /actions ----
     // CEO sessions ONLY. A shop token is rejected here even though it is
@@ -783,11 +812,36 @@ Bun.serve({
       // `type` is the app's own record kind — any product's kinds work
       // (laundry: order/customer/payment/rate/setting; an LIC office:
       // policy/customer/payment/...). The payload is stored as-is.
+      // v1.1.19: reserves `count` receipt-sequence numbers for one
+      // shop, in ONE atomic UPDATE, so two phones syncing at the same
+      // moment can never share a seq. The counter is first lifted to
+      // at least the highest stored seq (self-healing if the counter
+      // row was ever made after the records). Returns the first
+      // number of the range.
+      async function reserveSeq(shopId: number, count: number): Promise<number> {
+        await sqlRun(
+          "INSERT OR IGNORE INTO sync_meta (shop_id, epoch, seq) VALUES (?, ?, 0)",
+          shopId, randomBytes(16).toString("hex")
+        );
+        const row = await sqlOne<{ seq: number }>(
+          "UPDATE sync_meta SET seq = MAX(seq, (SELECT COALESCE(MAX(seq), 0) FROM sync_records WHERE shop_id = ?)) + ? WHERE shop_id = ? RETURNING seq",
+          shopId, count, shopId
+        );
+        const top = row?.seq ?? count;
+        return top - count + 1;
+      }
+
       if (path === "/api/sync" && req.method === "POST") {
         if (!isShop) return bad("Only a shop device can sync data.", 403);
         const body = await readJson(req);
         const deviceId = String(body?.deviceId ?? "").trim().slice(0, 64);
         const since = Number(body?.since ?? 0) || 0;
+        // v1.1.19: the pull cursor is a server receipt sequence, not a
+        // timestamp — see seq above. Old clients do not send sinceSeq;
+        // they keep the timestamp pull below.
+        const sinceSeqRaw = (body as any)?.sinceSeq;
+        const useSeq = typeof sinceSeqRaw === "number";
+        const sinceSeq = useSeq ? sinceSeqRaw : 0;
         const shopId = auth.shopId!;
         const app = await checkAppSoftware(shopId, body);
         if ("error" in app) return bad(app.error, 400);
@@ -805,34 +859,89 @@ Bun.serve({
         const changes = Array.isArray(body?.changes) ? body.changes : [];
         if (changes.length > 500) return bad("Too many changes in one sync (max 500).");
         const now = Date.now();
-        for (const c of changes) {
+        // Push echo (v1.1.19 L7): the time each pushed change was
+        // actually stored at (after the wrong-clock clamp). The phone
+        // adopts the stored time for its own unchanged change, so a
+        // future-dated clock stops re-sending it on every sync.
+        const stored: Array<{ type: string; id: string; updatedAt: number; seq: number }> = [];
+        // v1.1.19: one receipt-sequence range for this push, reserved
+        // up front so every stored change gets a unique, increasing
+        // seq even when two phones push at the same moment. Changes
+        // the last-write-wins check skips leave gaps — harmless.
+        const seqBase = changes.length > 0 ? await reserveSeq(shopId, changes.length) : 0;
+        for (let idx = 0; idx < changes.length; idx++) {
+          const c = changes[idx];
           const type = String(c?.type ?? "");
           const id = String(c?.id ?? "").trim().slice(0, 128);
-          const updatedAt = Number(c?.updatedAt ?? 0) || 0;
+          let updatedAt = Number(c?.updatedAt ?? 0) || 0;
+          // v1.1.19 (L7, wrong clock): a phone whose clock is hours
+          // ahead must not freeze the shop — its future stamp would
+          // win last-write-wins over every real edit until the other
+          // clocks catch up. Clamp it to server time (5 minutes of
+          // grace for ordinary drift). The phone adopts the clamped
+          // time when it pulls its own change back (see
+          // adoptClampedTime in the app), so it stops re-sending it.
+          let clamped = false;
+          if (updatedAt > now + 5 * 60 * 1000) { updatedAt = now; clamped = true; }
           if (!SYNC_TYPE_RE.test(type) || !id || updatedAt <= 0) continue;
-          const payload = typeof c?.payload === "string" ? c.payload : JSON.stringify(c?.payload ?? {});
+          let payload = typeof c?.payload === "string" ? c.payload : JSON.stringify(c?.payload ?? {});
+          // The clamp above only fixes the envelope. The payload JSON
+          // carries its own change time (the order / payment / rate
+          // row's updatedAt, the audit row's at) — if it stays in the
+          // future, another phone stores that future time, re-pushes
+          // it, and this panel clamps the re-push to a LATER server
+          // time, so the wrong-clock row beats a real edit made in
+          // between. Rewrite it to the clamped time so the stored
+          // record is self-consistent.
+          if (clamped) {
+            try {
+              const p = JSON.parse(payload);
+              if (p && typeof p === "object") {
+                if (typeof p.updatedAt === "number") p.updatedAt = updatedAt;
+                if (typeof p.at === "number") p.at = updatedAt;
+                payload = JSON.stringify(p);
+              }
+            } catch { /* not JSON — store as-is */ }
+          }
           const deleted = c?.deleted === true || c?.deleted === 1 ? 1 : 0;
           const cur = await sqlOne<{ updated_at: number; device_id: string }>(
             "SELECT updated_at, device_id FROM sync_records WHERE shop_id = ? AND entity_type = ? AND entity_id = ?",
             shopId, type, id
           );
           if (cur && (cur.updated_at > updatedAt || (cur.updated_at === updatedAt && cur.device_id >= deviceId))) continue;
+          const seq = seqBase + idx;
           await sqlRun(
-            "INSERT INTO sync_records (shop_id, entity_type, entity_id, payload, updated_at, device_id, deleted) VALUES (?, ?, ?, ?, ?, ?, ?) " +
-            "ON CONFLICT(shop_id, entity_type, entity_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at, device_id = excluded.device_id, deleted = excluded.deleted",
-            shopId, type, id, payload, updatedAt, deviceId, deleted
+            "INSERT INTO sync_records (shop_id, entity_type, entity_id, payload, updated_at, device_id, deleted, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
+            "ON CONFLICT(shop_id, entity_type, entity_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at, device_id = excluded.device_id, deleted = excluded.deleted, seq = excluded.seq",
+            shopId, type, id, payload, updatedAt, deviceId, deleted, seq
           );
+          stored.push({ type, id, updatedAt, seq });
         }
         await sqlRun("UPDATE devices SET last_sync_at = ? WHERE shop_id = ? AND device_id = ?", now, shopId, deviceId);
-        const pulled = await sqlAll<any>(
-          "SELECT entity_type AS type, entity_id AS id, payload, updated_at AS updatedAt, deleted FROM sync_records WHERE shop_id = ? AND updated_at > ? ORDER BY updated_at ASC",
-          shopId, since
-        );
+        // v1.1.19: the pull is by receipt sequence when the client
+        // sends one. A timestamp pull would miss a change stamped
+        // before the cursor (offline phone, or a clock behind the
+        // server); a seq is handed out at receipt time, so every
+        // stored change is newer than the cursor that missed it.
+        // Old clients (no sinceSeq) keep the timestamp pull.
+        const pulled = useSeq
+          ? await sqlAll<any>(
+              "SELECT entity_type AS type, entity_id AS id, payload, updated_at AS updatedAt, deleted, seq FROM sync_records WHERE shop_id = ? AND seq > ? ORDER BY seq ASC",
+              shopId, sinceSeq
+            )
+          : await sqlAll<any>(
+              "SELECT entity_type AS type, entity_id AS id, payload, updated_at AS updatedAt, deleted, 0 AS seq FROM sync_records WHERE shop_id = ? AND updated_at > ? ORDER BY updated_at ASC",
+              shopId, since
+            );
+        const serverSeqRow = await sqlOne<{ m: number }>("SELECT COALESCE(MAX(seq), 0) AS m FROM sync_records WHERE shop_id = ?", shopId);
+        const serverSeq = serverSeqRow?.m ?? 0;
         const deviceCountRow = await sqlOne<{ n: number }>("SELECT COUNT(*) AS n FROM devices WHERE shop_id = ? AND revoked = 0", shopId);
         const deviceCount = deviceCountRow?.n ?? 0;
         return json({
           changes: pulled.map((r) => ({ ...r, deleted: r.deleted === 1, payload: JSON.parse(r.payload || "{}") })),
+          stored,
           serverTime: now,
+          serverSeq,
           revoked: false,
           isMain: dev.is_main === 1,
           deviceCount,
