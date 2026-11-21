@@ -24,6 +24,15 @@
 //      GET  /api/keys                          -> {keys}
 //      POST /api/keys     {shopId, plan, status, expiresAt} -> {id, keyCode}
 //      POST /api/payments {amountInr, method, status, shopId, paidAt, note}
+//                           v1.1.20: NO-OP — customer payments were
+//                           removed from the panel (item 9); answers
+//                           {ok:true} and stores nothing so old phones
+//                           keep succeeding silently.
+//      POST /api/trial    {phone} -> {ok, trialStart, trialEnd, daysLeft}
+//                           3-day free trial by phone number (item 13);
+//                           first call starts it, later calls return
+//                           the same start. Any valid token.
+//      GET  /api/trials   -> {trials}  (CEO only)
 //      GET  /api/export                        -> full backup JSON
 //      POST /api/import   {backup}             -> import counts
 //  - GET  /health -> {ok:true}
@@ -188,6 +197,27 @@ CREATE TABLE IF NOT EXISTS sync_meta (
   -- v1.1.19: next receipt-sequence number for this shop (see seq).
   seq INTEGER NOT NULL DEFAULT 0
 );
+-- v1.1.20 item 12: money a shop pays Viru FOR ITS LICENCE (its own
+-- panel section). Separate from the old payments table above — that
+-- one held shops' customer payments and is now invisible history.
+CREATE TABLE IF NOT EXISTS licence_payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  shop_id INTEGER NOT NULL,
+  amount_inr INTEGER NOT NULL,
+  method TEXT NOT NULL DEFAULT 'upi',
+  note TEXT NOT NULL DEFAULT '',
+  paid_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL
+);
+-- v1.1.20 item 13: 3-day free trial, one row per phone number
+-- (canonical form). trial_start is the first day in Asia/Kolkata
+-- ("yyyy-MM-dd"). Never deleted by any panel action.
+CREATE TABLE IF NOT EXISTS trials (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  phone TEXT NOT NULL UNIQUE,
+  trial_start TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
 `;
 await turso.executeMultiple(CREATE_TABLES);
 
@@ -208,9 +238,34 @@ try {
 try {
   await turso.execute({ sql: "ALTER TABLE sync_meta ADD COLUMN seq INTEGER NOT NULL DEFAULT 0", args: [] });
 } catch { /* already there */ }
-await turso.execute({ sql: "UPDATE sync_records SET seq = id WHERE seq = 0", args: [] });
+// Scalable startup (2026-11-21): only run the seq backfill when a
+// seq = 0 row actually exists. After the first run no row matches, so
+// every later boot skips the full-table UPDATE scan (at 500 shops that
+// scan is millions of rows on every deploy / wake from sleep). The
+// sync_meta lift below touches one row per shop, so it stays cheap.
+const seqBackfillNeeded = await sqlOne<{ one: number }>(
+  "SELECT 1 AS one FROM sync_records WHERE seq = 0 LIMIT 1"
+);
+if (seqBackfillNeeded) {
+  await turso.execute({ sql: "UPDATE sync_records SET seq = id WHERE seq = 0", args: [] });
+}
 await turso.execute({ sql: "UPDATE sync_meta SET seq = MAX(seq, (SELECT COALESCE(MAX(seq), 0) FROM sync_records WHERE sync_records.shop_id = sync_meta.shop_id))", args: [] });
 await turso.execute({ sql: "CREATE INDEX IF NOT EXISTS idx_sync_records_seq ON sync_records (shop_id, seq)", args: [] });
+// Scalable lookups (2026-11-21): additive indexes only — no behaviour
+// change. They turn phone/status/shop lookups from full scans into
+// index lookups as shops, keys and payments grow. CREATE INDEX IF NOT
+// EXISTS is safe on the live database (no downtime, no data touched).
+await turso.executeMultiple(`
+CREATE INDEX IF NOT EXISTS idx_shops_phone ON shops (phone);
+CREATE INDEX IF NOT EXISTS idx_shops_status_software ON shops (status, software);
+CREATE INDEX IF NOT EXISTS idx_license_keys_shop ON license_keys (shop_id);
+CREATE INDEX IF NOT EXISTS idx_license_keys_status_expires ON license_keys (status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_payments_shop ON payments (shop_id);
+CREATE INDEX IF NOT EXISTS idx_payments_status_paid ON payments (status, paid_at);
+CREATE INDEX IF NOT EXISTS idx_licence_payments_shop ON licence_payments (shop_id);
+CREATE INDEX IF NOT EXISTS idx_shop_tokens_shop ON shop_tokens (shop_id);
+CREATE INDEX IF NOT EXISTS idx_activity_log_created ON activity_log (created_at);
+`);
 
 // First-run CEO account from environment variables (set in the Render
 // dashboard, never in a file): if no account exists yet, create the one
@@ -378,49 +433,43 @@ async function readJson(req: Request): Promise<any> {
   }
 }
 
-// Normalize the app's payment payload: status "paid" -> "received",
-// shopId may be a shop NAME string, paidAt may be epoch millis.
-async function resolveShopId(shopId: unknown): Promise<number | null> {
-  if (typeof shopId === "number" && Number.isInteger(shopId) && shopId > 0) return shopId;
-  if (typeof shopId === "string" && shopId.trim()) {
-    const name = shopId.trim();
-    const rows = await db.select().from(schema.shops).where(eq(schema.shops.name, name)).limit(1);
-    if (rows[0]) return rows[0].id;
-    const [row] = await db
-      .insert(schema.shops)
-      .values({ name, ownerName: "", phone: "", city: "", software: "", status: "active", notes: "Added by app sync." })
-      .returning({ id: schema.shops.id });
-    return row?.id ?? null;
-  }
-  return null;
-}
-
-function normalizeStatus(s: unknown): "received" | "pending" | "failed" | "refunded" {
-  if (s === "pending" || s === "failed" || s === "refunded") return s;
-  return "received"; // "paid" and anything else count as received
-}
-
-function normalizeMethod(m: unknown): "upi" | "cash" | "card" | "bank" | "other" {
-  if (m === "cash" || m === "card" || m === "bank" || m === "other") return m;
-  return "upi";
-}
-
 // Product names are normalized through src/products.ts — the one place
 // that defines the products. An app may send a short alias ("Laundry");
 // the panel stores the canonical name ("Laundry Management System").
 // Unknown names pass through unchanged ("Other" software).
 
-function normalizeDate(v: unknown): string {
-  if (typeof v === "number" && Number.isFinite(v) && v > 0) {
-    const d = new Date(v);
-    if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10);
-  }
-  if (typeof v === "string" && v) {
-    const d = new Date(v);
-    if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10);
-    if (/^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
-  }
-  return new Date().toISOString().slice(0, 10);
+// ---------- trial dates (v1.1.20 item 13) ----------
+// The 3-day trial runs on Asia/Kolkata calendar days: trial_start is
+// the IST day the phone first asked, the trial covers that day and the
+// next two (trialEnd = start + 2), and daysLeft counts whole IST days
+// until the end day — the end day itself is 0, past days are negative.
+// This math is the API contract with the Android app; do not change it.
+
+/** Today in Asia/Kolkata as "yyyy-MM-dd". */
+function istToday(): string {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(new Date());
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+/** "yyyy-MM-dd" plus n calendar days (UTC arithmetic — no DST in IST). */
+function addDays(day: string, n: number): string {
+  const d = new Date(`${day}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+
+/** Whole days from b to a (a - b); negative when a is before b. */
+function diffDays(a: string, b: string): number {
+  return Math.round((Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / 86400000);
+}
+
+/** Trial window for a stored start day: end = start + 2, daysLeft vs IST today. */
+function trialWindow(trialStart: string): { trialStart: string; trialEnd: string; daysLeft: number } {
+  const trialEnd = addDays(trialStart, 2);
+  return { trialStart, trialEnd, daysLeft: diffDays(trialEnd, istToday()) };
 }
 
 // ---------- static client ----------
@@ -430,8 +479,15 @@ const indexHtml = await Bun.file(`${CLIENT_DIR}/index.html`).text().catch(() => 
 async function serveStatic(path: string): Promise<Response | null> {
   const file = Bun.file(`${CLIENT_DIR}${path}`);
   if (await file.exists()) {
+    // Scalable caching (2026-11-21): files under /assets/ are
+    // content-hashed (the hash is in the file name), so a cached copy
+    // can never be stale — cache them for a year. Everything else
+    // (index.html) keeps the short 1-hour cache.
+    const cacheControl = path.startsWith("/assets/")
+      ? "public, max-age=31536000, immutable"
+      : "public, max-age=3600";
     return new Response(file, {
-      headers: { "cache-control": "public, max-age=3600" },
+      headers: { "cache-control": cacheControl },
     });
   }
   return null;
@@ -656,33 +712,47 @@ Bun.serve({
         return json(r.data);
       }
       if (path === "/api/payments" && req.method === "POST") {
+        // v1.1.20 item 9: customer payments are REMOVED from the panel.
+        // This endpoint is now a no-op — it stores nothing and always
+        // answers ok, so v1.1.19 phones that still send a payment after
+        // each bill keep succeeding silently. The old payments rows
+        // stay in the table as invisible history; nothing reads them.
+        // (Auth already happened above: requireAuth ran for this route.)
+        await readJson(req).catch(() => ({}));
+        return json({ ok: true });
+      }
+      // ---- 3-day free trial (v1.1.20 item 13) ----
+      // The trial is recorded HERE, by phone number — never only on
+      // the phone — so reinstalling the app with the same number gets
+      // no new trial. API contract with the Android app (do not change
+      // the shapes): POST /api/trial {phone} ->
+      // {ok, trialStart, trialEnd, daysLeft}; the first call for a
+      // number starts the trial today (Asia/Kolkata), every later call
+      // returns the SAME start. Any valid token may call it (the same
+      // requireAuth as every other /api route).
+      if (path === "/api/trial" && req.method === "POST") {
         const body = await readJson(req);
-        const amount = Number(body?.amountInr);
-        if (!Number.isFinite(amount) || amount <= 0 || !Number.isInteger(amount)) {
-          return bad("Enter a valid amount in rupees (whole number above 0).");
-        }
-        let shopId: number | null;
-        if (isShop) {
-          // The shop token IS the shop's identity (v1.1.16): a payment
-          // recorded on this phone always belongs to the token's shop.
-          // The string shop id the app sends is the shop's PHONE (new
-          // clients) or its NAME (old clients) — either way it can only
-          // ever resolve to the own shop, and a renamed shop must never
-          // fail a payment sync, so the token decides and the string is
-          // never used to pick a shop.
-          shopId = auth.shopId;
-        } else {
-          shopId = await resolveShopId(body?.shopId);
-        }
-        const r = await callAction("createPayment", {
-          token, shopId: shopId ?? 0, amountInr: amount,
-          method: normalizeMethod(body?.method),
-          status: normalizeStatus(body?.status),
-          note: String(body?.note ?? ""),
-          paidAt: normalizeDate(body?.paidAt),
-        });
-        if (r.error) return bad(r.error, 400);
-        return json(r.data);
+        const phone = canonicalPhone(body?.phone);
+        if (!phone) return bad("A valid phone number is required.");
+        // INSERT OR IGNORE + SELECT: the first call wins, a reinstall
+        // (or two phones racing) can never reset the start day.
+        await sqlRun(
+          "INSERT OR IGNORE INTO trials (phone, trial_start, created_at) VALUES (?, ?, ?)",
+          phone, istToday(), Date.now()
+        );
+        const row = await sqlOne<{ trial_start: string }>(
+          "SELECT trial_start FROM trials WHERE phone = ?", phone
+        );
+        if (!row) return bad("Could not start the trial. Please try again.", 500);
+        return json({ ok: true, ...trialWindow(row.trial_start) });
+      }
+      // CEO-only list of every trial ever started (panel Trials list).
+      if (path === "/api/trials" && req.method === "GET") {
+        if (isShop) return bad("Only the CEO can list trials.", 403);
+        const rows = await sqlAll<{ phone: string; trial_start: string }>(
+          "SELECT phone, trial_start FROM trials ORDER BY trial_start DESC, id DESC"
+        );
+        return json({ trials: rows.map((r) => ({ phone: r.phone, ...trialWindow(r.trial_start) })) });
       }
       if (path === "/api/export" && req.method === "GET") {
         if (isShop) return bad("Only the CEO can export the panel backup.", 403);
@@ -873,6 +943,18 @@ Bun.serve({
         // seq even when two phones push at the same moment. Changes
         // the last-write-wins check skips leave gaps — harmless.
         const seqBase = changes.length > 0 ? await reserveSeq(shopId, changes.length) : 0;
+        // Scalable push (2026-11-21): the old loop did one SELECT + one
+        // UPSERT per change — a 500-change backlog was ~1,010 database
+        // round trips (15–50 s, can time out). Now: prepare every
+        // change in memory (same clamp + payload rules), read all
+        // existing rows in ONE query, apply the same last-write-wins
+        // rule in memory (in push order, so a repeated entity in one
+        // push behaves exactly as before), then write the winners in
+        // multi-row UPSERTs of 100 rows. Same stored echo, same seq
+        // numbers (seqBase + idx, gaps for skipped changes), same
+        // final rows — just a handful of round trips instead of 1,010.
+        type PreparedChange = { idx: number; type: string; id: string; payload: string; updatedAt: number; deleted: number };
+        const prepared: PreparedChange[] = [];
         for (let idx = 0; idx < changes.length; idx++) {
           const c = changes[idx];
           const type = String(c?.type ?? "");
@@ -908,20 +990,53 @@ Bun.serve({
             } catch { /* not JSON — store as-is */ }
           }
           const deleted = c?.deleted === true || c?.deleted === 1 ? 1 : 0;
-          const cur = await sqlOne<{ updated_at: number; device_id: string }>(
-            "SELECT updated_at, device_id FROM sync_records WHERE shop_id = ? AND entity_type = ? AND entity_id = ?",
-            shopId, type, id
-          );
-          if (cur && (cur.updated_at > updatedAt || (cur.updated_at === updatedAt && cur.device_id >= deviceId))) continue;
-          const seq = seqBase + idx;
-          await sqlRun(
-            "INSERT INTO sync_records (shop_id, entity_type, entity_id, payload, updated_at, device_id, deleted, seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
-            "ON CONFLICT(shop_id, entity_type, entity_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at, device_id = excluded.device_id, deleted = excluded.deleted, seq = excluded.seq",
-            shopId, type, id, payload, updatedAt, deviceId, deleted, seq
-          );
-          stored.push({ type, id, updatedAt, seq });
+          prepared.push({ idx, type, id, payload, updatedAt, deleted });
         }
-        await sqlRun("UPDATE devices SET last_sync_at = ? WHERE shop_id = ? AND device_id = ?", now, shopId, deviceId);
+        if (prepared.length > 0) {
+          const ids = [...new Set(prepared.map((p) => p.id))];
+          const placeholders = ids.map(() => "?").join(",");
+          const existingRows = await sqlAll<{ entity_type: string; entity_id: string; updated_at: number; device_id: string }>(
+            `SELECT entity_type, entity_id, updated_at, device_id FROM sync_records WHERE shop_id = ? AND entity_id IN (${placeholders})`,
+            shopId, ...ids
+          );
+          const curByKey = new Map<string, { updated_at: number; device_id: string }>();
+          for (const r of existingRows) {
+            curByKey.set(`${r.entity_type}\0${r.entity_id}`, { updated_at: r.updated_at, device_id: r.device_id });
+          }
+          // Winners keyed by entity — if one push carries the same
+          // entity twice, only the last winner needs writing (the
+          // stored echo below still lists every winner, as before).
+          const winnersByKey = new Map<string, PreparedChange & { seq: number }>();
+          for (const p of prepared) {
+            const key = `${p.type}\0${p.id}`;
+            const cur = curByKey.get(key);
+            if (cur && (cur.updated_at > p.updatedAt || (cur.updated_at === p.updatedAt && cur.device_id >= deviceId))) continue;
+            const seq = seqBase + p.idx;
+            winnersByKey.set(key, { ...p, seq });
+            curByKey.set(key, { updated_at: p.updatedAt, device_id: deviceId });
+            stored.push({ type: p.type, id: p.id, updatedAt: p.updatedAt, seq });
+          }
+          const winners = [...winnersByKey.values()];
+          for (let start = 0; start < winners.length; start += 100) {
+            const chunk = winners.slice(start, start + 100);
+            const valuesSql = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?)").join(", ");
+            const args: (string | number)[] = [];
+            for (const w of chunk) args.push(shopId, w.type, w.id, w.payload, w.updatedAt, deviceId, w.deleted, w.seq);
+            await sqlRun(
+              `INSERT INTO sync_records (shop_id, entity_type, entity_id, payload, updated_at, device_id, deleted, seq) VALUES ${valuesSql} ` +
+              "ON CONFLICT(shop_id, entity_type, entity_id) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at, device_id = excluded.device_id, deleted = excluded.deleted, seq = excluded.seq",
+              ...args
+            );
+          }
+        }
+        // Scalable (2026-11-21): write last_sync_at at most once per
+        // 5 minutes per device. The device row is already loaded, so
+        // this costs no extra query and saves a write on every sync.
+        // "Last sync" in the panel stays accurate to 5 minutes.
+        const lastSyncAt = Number(dev.last_sync_at ?? 0) || 0;
+        if (!lastSyncAt || now - lastSyncAt >= 5 * 60 * 1000) {
+          await sqlRun("UPDATE devices SET last_sync_at = ? WHERE shop_id = ? AND device_id = ?", now, shopId, deviceId);
+        }
         // v1.1.19: the pull is by receipt sequence when the client
         // sends one. A timestamp pull would miss a change stamped
         // before the cursor (offline phone, or a clock behind the
