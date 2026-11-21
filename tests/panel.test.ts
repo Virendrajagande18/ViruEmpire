@@ -7,6 +7,11 @@
 // must never regress (3-device cap counting active devices only, first
 // device = main, only main can revoke, revoked = view-only, key checksum
 // mod 36^4, login rate limit, no seed/demo data on a fresh DB).
+// v1.1.20: customer payments removed (POST /api/payments is a no-op,
+// dashboard revenue stays 0, no payment log entries), licence payments
+// (money shops pay for their licence — add/edit/delete + log), and the
+// 3-day trial by phone number (first call starts it, reinstall gets no
+// new trial, IST daysLeft math).
 //
 // No real shop data is used: every name, phone and amount here is made
 // up for the test and lives only in the throwaway DB.
@@ -153,10 +158,14 @@ describe("shops — one per product", () => {
     expect(byName.get("Test Fataka Stall")).toBe("Fataka Stall Website");
   });
 
-  test("per-product dashboard totals", async () => {
+  test("per-product dashboard totals (customer payments removed — revenue stays 0)", async () => {
+    // v1.1.20 item 9: recording a customer payment stores nothing and
+    // the dashboard no longer reads the payments table, so every
+    // payment-derived number stays 0. Shops per product still work.
     const pay = async (shopId: number, amountInr: number, status: string) => {
       const r = await act("createPayment", { token: ceoToken, shopId, amountInr, method: "upi", status, note: "test", paidAt: new Date().toISOString().slice(0, 10) });
       expect(r.status).toBe(200);
+      expect(r.data.id).toBe(0); // no-op: nothing stored
     };
     await pay(shopIds.laundry, 5000, "received");
     await pay(shopIds.oil, 3000, "received");
@@ -164,17 +173,24 @@ describe("shops — one per product", () => {
     await pay(shopIds.fataka, 2000, "received");
     const d = await act("getDashboard", { token: ceoToken, months: 6 });
     expect(d.error).toBeNull();
-    expect(d.data.kpis.totalRevenueInr).toBe(10000);
-    expect(d.data.kpis.pendingAmountInr).toBe(1000);
+    expect(d.data.kpis.totalRevenueInr).toBe(0);
+    expect(d.data.kpis.revenueThisMonthInr).toBe(0);
+    expect(d.data.kpis.pendingAmountInr).toBe(0);
+    expect(d.data.kpis.pendingCount).toBe(0);
+    expect(d.data.recentPayments).toEqual([]);
     const byProduct = new Map(d.data.productSummaries.map((p: any) => [p.software, p]));
     expect((byProduct.get("Laundry Management System") as any).shops).toBe(1);
-    expect((byProduct.get("Laundry Management System") as any).revenueInr).toBe(5000);
+    expect((byProduct.get("Laundry Management System") as any).revenueInr).toBe(0);
     expect((byProduct.get("Oil Dealership Software") as any).shops).toBe(1);
-    expect((byProduct.get("Oil Dealership Software") as any).revenueInr).toBe(3000);
+    expect((byProduct.get("Oil Dealership Software") as any).revenueInr).toBe(0);
     expect((byProduct.get("LIC & Star Health Office System") as any).shops).toBe(1);
     expect((byProduct.get("LIC & Star Health Office System") as any).revenueInr).toBe(0);
     expect((byProduct.get("Fataka Stall Website") as any).shops).toBe(1);
-    expect((byProduct.get("Fataka Stall Website") as any).revenueInr).toBe(2000);
+    expect((byProduct.get("Fataka Stall Website") as any).revenueInr).toBe(0);
+    // And the payments table itself is untouched (still empty here).
+    const pays = await act("listPayments", { token: ceoToken, search: "", status: "all", method: "all" });
+    expect(pays.data.payments).toEqual([]);
+    expect(pays.data.totals.count).toBe(0);
   });
 });
 
@@ -319,7 +335,7 @@ describe("devices + sync — generic, not laundry-only", () => {
 });
 
 describe("activity log names the software", () => {
-  test("key + payment entries carry the product name", async () => {
+  test("key + shop entries carry the product name; no customer-payment entries", async () => {
     const r = await act("listActivity", { token: ceoToken, limit: 100 });
     expect(r.status).toBe(200);
     expect(r.error).toBeNull();
@@ -327,6 +343,10 @@ describe("activity log names the software", () => {
     expect(text).toContain("Fataka Stall Website");
     expect(text).toContain("Oil Dealership Software");
     expect(text).toContain("Laundry Management System");
+    // v1.1.20 item 9: customer-payment log entries are gone for good.
+    const actions = r.data.entries.map((e: any) => e.action);
+    expect(actions).not.toContain("Recorded payment");
+    expect(actions).not.toContain("Deleted payment");
   });
 });
 
@@ -488,6 +508,174 @@ describe("panel backup import (v1.1.16)", () => {
     const pay = pays.data.payments.find((p: any) => p.note === "import-link-test-777");
     expect(pay.shopId).toBe(shopId);
     expect(pay.shopName).toBe("Renamed Link Shop");
+  });
+});
+
+describe("customer payments removed (v1.1.20 item 9)", () => {
+  test("POST /api/payments is a no-op: ok:true, stores nothing (CEO + shop token)", async () => {
+    const before = await act("listPayments", { token: ceoToken, search: "", status: "all", method: "all" });
+    const countBefore = before.data.totals.count;
+    const r1 = await call("/api/payments", { token: ceoToken, body: { amountInr: 500, method: "upi", status: "paid", shopId: shopIds.laundry, paidAt: Date.now() } });
+    expect(r1.status).toBe(200);
+    expect(r1.json.ok).toBe(true);
+    const r2 = await call("/api/payments", { token: shopTokens.laundry, body: { amountInr: 700, method: "cash", status: "paid", shopId: "9000000001", paidAt: Date.now() } });
+    expect(r2.status).toBe(200);
+    expect(r2.json.ok).toBe(true);
+    // Even a malformed body succeeds silently (old phones must never break).
+    const r3 = await call("/api/payments", { token: shopTokens.laundry, body: { amountInr: -5 } });
+    expect(r3.status).toBe(200);
+    expect(r3.json.ok).toBe(true);
+    const after = await act("listPayments", { token: ceoToken, search: "", status: "all", method: "all" });
+    expect(after.data.totals.count).toBe(countBefore);
+  });
+
+  test("POST /api/payments without a token is still rejected", async () => {
+    const r = await call("/api/payments", { body: { amountInr: 100 } });
+    expect(r.status).toBe(401);
+  });
+
+  test("no Recorded/Deleted payment entries in the activity log", async () => {
+    const r = await act("listActivity", { token: ceoToken, limit: 200 });
+    const actions = r.data.entries.map((e: any) => e.action);
+    expect(actions).not.toContain("Recorded payment");
+    expect(actions).not.toContain("Deleted payment");
+  });
+});
+
+describe("licence payments (v1.1.20 item 12)", () => {
+  let lpId = 0;
+
+  test("record, list newest-first with shop name, total", async () => {
+    const c1 = await act("createLicencePayment", { token: ceoToken, shopId: shopIds.laundry, amountInr: 5000, method: "upi", note: "Yearly licence", paidAt: "2026-11-01" });
+    expect(c1.error).toBeNull();
+    lpId = c1.data.id;
+    const c2 = await act("createLicencePayment", { token: ceoToken, shopId: shopIds.oil, amountInr: 3000, method: "cash", note: "Monthly licence", paidAt: "2026-11-10" });
+    expect(c2.error).toBeNull();
+    const list = await act("listLicencePayments", { token: ceoToken });
+    expect(list.error).toBeNull();
+    expect(list.data.totalInr).toBe(8000);
+    expect(list.data.payments.length).toBe(2);
+    // Newest first (by paid date).
+    expect(list.data.payments[0].id).toBe(c2.data.id);
+    expect(list.data.payments[0].shopName).toBe("Test Oil Traders");
+    expect(list.data.payments[0].software).toBe("Oil Dealership Software");
+    expect(list.data.payments[1].shopName).toBe("Test Wash House");
+    // The old customer-payments table is untouched by licence payments.
+    const old = await act("listPayments", { token: ceoToken, search: "Yearly licence", status: "all", method: "all" });
+    expect(old.data.payments).toEqual([]);
+  });
+
+  test("edit a licence payment", async () => {
+    const u = await act("updateLicencePayment", { token: ceoToken, id: lpId, shopId: shopIds.laundry, amountInr: 5500, method: "bank", note: "Yearly licence (corrected)", paidAt: "2026-11-02" });
+    expect(u.error).toBeNull();
+    const list = await act("listLicencePayments", { token: ceoToken });
+    const mine = list.data.payments.find((p: any) => p.id === lpId);
+    expect(mine.amountInr).toBe(5500);
+    expect(mine.method).toBe("bank");
+    expect(mine.note).toBe("Yearly licence (corrected)");
+    expect(mine.paidAt).toBe("2026-11-02");
+    expect(list.data.totalInr).toBe(8500);
+  });
+
+  test("delete a licence payment; add/edit/delete are in the activity log", async () => {
+    const d = await act("deleteLicencePayment", { token: ceoToken, id: lpId });
+    expect(d.error).toBeNull();
+    const list = await act("listLicencePayments", { token: ceoToken });
+    expect(list.data.payments.find((p: any) => p.id === lpId)).toBeUndefined();
+    expect(list.data.totalInr).toBe(3000);
+    const log = await act("listActivity", { token: ceoToken, limit: 200 });
+    const actions = log.data.entries.map((e: any) => e.action);
+    expect(actions).toContain("Recorded licence payment");
+    expect(actions).toContain("Edited licence payment");
+    expect(actions).toContain("Deleted licence payment");
+  });
+
+  test("shop token cannot use licence payment actions", async () => {
+    const r = await act("listLicencePayments", { token: shopTokens.laundry });
+    expect(r.status).toBe(401);
+  });
+});
+
+describe("3-day trial (v1.1.20 item 13)", () => {
+  // Same IST math as the server (the API contract with the app).
+  function istToday(): string {
+    const parts = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(new Date());
+    const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+    return `${get("year")}-${get("month")}-${get("day")}`;
+  }
+  function addDays(day: string, n: number): string {
+    const d = new Date(`${day}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() + n);
+    return d.toISOString().slice(0, 10);
+  }
+
+  test("first call starts the trial today (IST), end = start + 2, daysLeft 2", async () => {
+    const r = await call("/api/trial", { token: ceoToken, body: { phone: "9811111111" } });
+    expect(r.status).toBe(200);
+    expect(r.json.ok).toBe(true);
+    expect(r.json.trialStart).toBe(istToday());
+    expect(r.json.trialEnd).toBe(addDays(istToday(), 2));
+    expect(r.json.daysLeft).toBe(2);
+  });
+
+  test("second call with same phone (any format) returns the SAME start — reinstall gets no new trial", async () => {
+    const r = await call("/api/trial", { token: shopTokens.laundry, body: { phone: "+91 98111 11111" } });
+    expect(r.status).toBe(200);
+    expect(r.json.trialStart).toBe(istToday());
+    expect(r.json.daysLeft).toBe(2);
+  });
+
+  test("a different phone gets its own trial", async () => {
+    const r = await call("/api/trial", { token: ceoToken, body: { phone: "9822222222" } });
+    expect(r.status).toBe(200);
+    expect(r.json.trialStart).toBe(istToday());
+    expect(r.json.daysLeft).toBe(2);
+  });
+
+  test("daysLeft math: an old trial is over (negative), end day is 0", async () => {
+    // Seed trial rows directly in the throwaway DB: one started 5 days
+    // ago (end was 3 days ago -> daysLeft -3), one started 2 days ago
+    // (today is the end day -> daysLeft 0). The API must return those
+    // stored starts unchanged.
+    const { createClient } = await import("@libsql/client");
+    const c = createClient({ url: TURSO_URL });
+    const oldStart = addDays(istToday(), -5);
+    const endStart = addDays(istToday(), -2);
+    await c.execute({ sql: "INSERT OR IGNORE INTO trials (phone, trial_start, created_at) VALUES (?, ?, ?)", args: ["9833333333", oldStart, Date.now()] });
+    await c.execute({ sql: "INSERT OR IGNORE INTO trials (phone, trial_start, created_at) VALUES (?, ?, ?)", args: ["9844444444", endStart, Date.now()] });
+    const old = await call("/api/trial", { token: ceoToken, body: { phone: "9833333333" } });
+    expect(old.status).toBe(200);
+    expect(old.json.trialStart).toBe(oldStart);
+    expect(old.json.trialEnd).toBe(addDays(oldStart, 2));
+    expect(old.json.daysLeft).toBe(-3);
+    const end = await call("/api/trial", { token: ceoToken, body: { phone: "9844444444" } });
+    expect(end.status).toBe(200);
+    expect(end.json.trialStart).toBe(endStart);
+    expect(end.json.daysLeft).toBe(0);
+  });
+
+  test("GET /api/trials lists all trials for the CEO; shop token is refused", async () => {
+    const r = await call("/api/trials", { token: ceoToken });
+    expect(r.status).toBe(200);
+    const phones = r.json.trials.map((t: any) => t.phone);
+    expect(phones).toContain("9811111111");
+    expect(phones).toContain("9822222222");
+    expect(phones).toContain("9833333333");
+    const mine = r.json.trials.find((t: any) => t.phone === "9811111111");
+    expect(mine.trialStart).toBe(istToday());
+    expect(mine.trialEnd).toBe(addDays(istToday(), 2));
+    expect(mine.daysLeft).toBe(2);
+    const refused = await call("/api/trials", { token: shopTokens.laundry });
+    expect(refused.status).toBe(403);
+  });
+
+  test("trial without a token is rejected; bad phone is rejected", async () => {
+    const noAuth = await call("/api/trial", { body: { phone: "9855555555" } });
+    expect(noAuth.status).toBe(401);
+    const badPhone = await call("/api/trial", { token: ceoToken, body: { phone: "" } });
+    expect(badPhone.status).toBe(400);
   });
 });
 
@@ -815,5 +1003,45 @@ describe("keep-alive ping + 3-phone sync (v1.1.19)", () => {
     // allowed; the message says to assign a new main first).
     const never = await call("/api/devices/sync119-a/revoke", { token: token3, body: { callerDeviceId: "sync119-a" } });
     expect(never.status).toBe(400);
+  });
+
+  test("scalable push (2026-11-21): 500 changes in one sync all store, older re-push is skipped", async () => {
+    const base = Date.now() - 60_000;
+    const changes = Array.from({ length: 500 }, (_, i) => ({
+      type: "order",
+      id: `scale-${i}`,
+      payload: { code: `LD-S-${i}`, total: i },
+      updatedAt: base + i * 10,
+    }));
+    const t0 = Date.now();
+    const push = await call("/api/sync", {
+      token: token3,
+      body: { deviceId: "sync119-b", since: 0, software: SOFTWARE, changes },
+    });
+    const elapsed = Date.now() - t0;
+    expect(push.status).toBe(200);
+    expect(push.json.stored.length).toBe(500);
+    expect(push.json.serverSeq).toBe(push.json.stored[499].seq);
+    // Batched push must stay well under the old per-change cost.
+    expect(elapsed).toBeLessThan(10_000);
+    // Re-pushing the same 500 with older stamps stores nothing
+    // (last-write-wins unchanged by batching).
+    const again = await call("/api/sync", {
+      token: token3,
+      body: {
+        deviceId: "sync119-b", since: 0, software: SOFTWARE,
+        changes: changes.map((c) => ({ ...c, updatedAt: c.updatedAt - 1000 })),
+      },
+    });
+    expect(again.status).toBe(200);
+    expect(again.json.stored.length).toBe(0);
+    // A fresh pull by seq sees all 500 scale bills exactly once.
+    const pull = await call("/api/sync", {
+      token: token3,
+      body: { deviceId: "sync119-b", sinceSeq: 0, since: 0, software: SOFTWARE, changes: [] },
+    });
+    expect(pull.status).toBe(200);
+    const scale = pull.json.changes.filter((c: any) => c.type === "order" && String(c.id).startsWith("scale-"));
+    expect(scale.length).toBe(500);
   });
 });
