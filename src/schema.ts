@@ -168,3 +168,42 @@ export const syncMeta = sqliteTable("sync_meta", {
   shopId: integer("shop_id").primaryKey(),
   epoch: text("epoch").notNull(),
 });
+
+// licence_payments (v1.1.20 item 12): money a shop pays Viru FOR ITS
+// LICENCE — recorded and edited by the CEO in its own panel section.
+// This is NOT the old `payments` table (shops' small customer payments,
+// removed from the panel in item 9; those rows stay as invisible
+// history and nothing new is written there). paid_at is the day the
+// shop paid (timestamp_ms, like payments.paid_at).
+export const licencePayments = sqliteTable("licence_payments", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  shopId: integer("shop_id").notNull(),
+  amountInr: integer("amount_inr").notNull(),
+  method: text("method", {
+    enum: ["upi", "cash", "card", "bank", "other"],
+  })
+    .notNull()
+    .default("upi"),
+  note: text("note").notNull().default(""),
+  paidAt: integer("paid_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// trials (v1.1.20 item 13): one row per phone number that ever started
+// the 3-day free trial. The PHONE is the identity (canonical form, see
+// src/phone.ts) — reinstalling the app with the same number finds this
+// row and gets no new trial. trial_start is the first day in
+// Asia/Kolkata as "yyyy-MM-dd" text. Trial rows are never deleted by
+// any panel action (not shop delete, not clear-all).
+export const trials = sqliteTable("trials", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  phone: text("phone").notNull().unique(),
+  trialStart: text("trial_start").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});

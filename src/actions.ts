@@ -196,6 +196,19 @@ const paymentShape = z.object({
   paidAt: z.string(),
 });
 
+// v1.1.20 item 12: a licence payment is money a shop pays Viru FOR ITS
+// LICENCE. No status — the CEO records money actually received.
+const licencePaymentShape = z.object({
+  id: z.number(),
+  shopId: z.number(),
+  shopName: z.string().nullable(),
+  software: z.string().nullable(),
+  amountInr: z.number(),
+  method: z.string(),
+  note: z.string(),
+  paidAt: z.string(),
+});
+
 const tokenReq = { token: z.string().min(1) };
 
 const activityShape = z.object({
@@ -452,11 +465,17 @@ export const Actions = {
     async handler(ctx, args) {
       await requireSession(ctx, args.token);
       const db = ctx.db<typeof schema>();
-      const [shopRows, keyRows, payRows] = await Promise.all([
+      const [shopRows, keyRows] = await Promise.all([
         db.select().from(schema.shops).orderBy(desc(schema.shops.id)),
         db.select().from(schema.licenseKeys).orderBy(desc(schema.licenseKeys.id)),
-        db.select().from(schema.payments).orderBy(desc(schema.payments.paidAt)),
       ]);
+      // v1.1.20 item 9: customer payments are removed from the panel —
+      // the dashboard no longer reads the payments table at all. The
+      // payment-derived fields below stay in the response shape (zeros
+      // / empty) so older clients keep loading; the panel UI no longer
+      // shows them. Old payment rows remain as invisible history, and
+      // licence money lives in its own section (licence_payments).
+      const payRows: Array<{ id: number; shopId: number | null; amountInr: number; method: string; status: string; note: string; paidAt: Date }> = [];
 
       const shopName = new Map(shopRows.map((s) => [s.id, s.name]));
       const shopSoftware = new Map(shopRows.map((s) => [s.id, s.software]));
@@ -617,11 +636,14 @@ export const Actions = {
     async handler(ctx, args) {
       await requireApiToken(ctx, args.token);
       const db = ctx.db<typeof schema>();
-      const [shopRows, keyRows, payRows] = await Promise.all([
+      const [shopRows, keyRows] = await Promise.all([
         db.select().from(schema.shops).orderBy(desc(schema.shops.id)),
         db.select().from(schema.licenseKeys),
-        db.select().from(schema.payments),
       ]);
+      // v1.1.20 item 9: per-shop customer-payment totals are removed —
+      // totalPaidInr stays in the shape as 0 and the UI no longer
+      // shows it. Licence money is in licence_payments (item 12).
+      const payRows: Array<{ shopId: number | null; amountInr: number; status: string }> = [];
       const q = args.search.trim().toLowerCase();
       const filtered = shopRows.filter((s) => {
         if (args.status !== "all" && s.status !== args.status) return false;
@@ -1013,7 +1035,7 @@ export const Actions = {
   }),
 
   createPayment: defineAction({
-    description: "Records a payment from a shop (received, pending, failed or refunded).",
+    description: "REMOVED in v1.1.20 (item 9): customer payments no longer exist in the panel. Kept as a no-op returning id 0 so old callers keep succeeding silently; nothing is stored. Licence money is recorded with createLicencePayment instead.",
     request: z.object({
       ...tokenReq,
       shopId: z.number().int().default(0),
@@ -1026,20 +1048,8 @@ export const Actions = {
     response: z.object({ id: z.number() }),
     async handler(ctx, args) {
       await requireApiToken(ctx, args.token);
-      const db = ctx.db<typeof schema>();
-      const [row] = await db
-        .insert(schema.payments)
-        .values({
-          shopId: args.shopId > 0 ? args.shopId : null,
-          amountInr: args.amountInr, method: args.method, status: args.status,
-          note: args.note, paidAt: dateFromDay(args.paidAt) ?? new Date(),
-        })
-        .returning({ id: schema.payments.id });
-      if (!row) throw new Error("Could not record the payment.");
-      const tag = await shopTag(ctx, args.shopId > 0 ? args.shopId : null);
-      await logActivity(ctx, "Recorded payment", `₹${args.amountInr} (${args.method}, ${args.status})${tag ? ` from ${tag}` : " — no shop linked"}.`);
-      ctx.invalidateQueries();
-      return { id: row.id };
+      // No-op by design (item 9): no row, no activity-log entry.
+      return { id: 0 };
     },
   }),
 
@@ -1179,16 +1189,132 @@ export const Actions = {
   }),
 
   deletePayment: defineAction({
-    description: "Deletes a payment record permanently.",
+    description: "Deletes a payment record permanently. (Customer payments were removed from the panel UI in v1.1.20 item 9 — this stays only so old history rows can be cleaned up; it writes no activity-log entry.)",
     request: z.object({ ...tokenReq, id: z.number().int().positive() }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
       await requireSession(ctx, args.token);
       const db = ctx.db<typeof schema>();
-      const payRow = await db.select().from(schema.payments).where(eq(schema.payments.id, args.id)).limit(1);
       await db.delete(schema.payments).where(eq(schema.payments.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  // ---------- licence payments (v1.1.20 item 12) ----------
+  // Money a shop pays Viru FOR ITS LICENCE, recorded by the CEO in its
+  // own panel section. Separate table (licence_payments) — never the
+  // old customer-payments table. Add/edit/delete ARE written to the
+  // Activity Log (unlike the removed customer-payment entries).
+
+  listLicencePayments: defineAction({
+    description: "Lists licence payments (money shops paid Viru for their licence), newest first, with shop names.",
+    request: z.object({ ...tokenReq }),
+    response: z.object({
+      payments: z.array(licencePaymentShape),
+      totalInr: z.number(),
+    }),
+    async handler(ctx, args) {
+      await requireSession(ctx, args.token);
+      const db = ctx.db<typeof schema>();
+      const [payRows, shopRows] = await Promise.all([
+        db.select().from(schema.licencePayments).orderBy(desc(schema.licencePayments.paidAt), desc(schema.licencePayments.id)),
+        db.select().from(schema.shops),
+      ]);
+      const shopName = new Map(shopRows.map((s) => [s.id, s.name]));
+      const shopSoftware = new Map(shopRows.map((s) => [s.id, s.software]));
+      return {
+        payments: payRows.map((p) => ({
+          id: p.id, shopId: p.shopId,
+          shopName: shopName.get(p.shopId) ?? null,
+          software: shopSoftware.get(p.shopId) ?? null,
+          amountInr: p.amountInr, method: p.method,
+          note: p.note, paidAt: dayString(p.paidAt) ?? "",
+        })),
+        totalInr: payRows.reduce((sum, p) => sum + p.amountInr, 0),
+      };
+    },
+  }),
+
+  createLicencePayment: defineAction({
+    description: "Records a shop's payment for its licence (money the shop paid Viru).",
+    request: z.object({
+      ...tokenReq,
+      shopId: z.number().int().positive(),
+      amountInr: z.number().int().positive().max(100000000),
+      method: z.enum(["upi", "cash", "card", "bank", "other"]).default("upi"),
+      note: z.string().trim().max(300).default(""),
+      paidAt: z.string().max(10).default(""),
+    }),
+    response: z.object({ id: z.number() }),
+    async handler(ctx, args) {
+      await requireSession(ctx, args.token);
+      const db = ctx.db<typeof schema>();
+      const [row] = await db
+        .insert(schema.licencePayments)
+        .values({
+          shopId: args.shopId,
+          amountInr: args.amountInr, method: args.method,
+          note: args.note, paidAt: dateFromDay(args.paidAt) ?? new Date(),
+        })
+        .returning({ id: schema.licencePayments.id });
+      if (!row) throw new Error("Could not record the licence payment.");
+      const tag = await shopTag(ctx, args.shopId);
+      await logActivity(ctx, "Recorded licence payment", `₹${args.amountInr} (${args.method})${tag ? ` from ${tag}` : ""}.`);
+      ctx.invalidateQueries();
+      return { id: row.id };
+    },
+  }),
+
+  updateLicencePayment: defineAction({
+    description: "Edits a licence payment record — correct the shop, amount, method, note or date.",
+    request: z.object({
+      ...tokenReq,
+      id: z.number().int().positive(),
+      shopId: z.number().int().positive(),
+      amountInr: z.number().int().positive().max(100000000),
+      method: z.enum(["upi", "cash", "card", "bank", "other"]).default("upi"),
+      note: z.string().trim().max(300).default(""),
+      paidAt: z.string().max(10).default(""),
+    }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      await requireSession(ctx, args.token);
+      const db = ctx.db<typeof schema>();
+      const before = await db.select().from(schema.licencePayments).where(eq(schema.licencePayments.id, args.id)).limit(1);
+      const paid = dateFromDay(args.paidAt);
+      await db
+        .update(schema.licencePayments)
+        .set({
+          shopId: args.shopId,
+          amountInr: args.amountInr,
+          method: args.method,
+          note: args.note,
+          ...(paid ? { paidAt: paid } : {}),
+        })
+        .where(eq(schema.licencePayments.id, args.id));
+      const old = before[0];
+      const tag = await shopTag(ctx, args.shopId);
+      await logActivity(ctx, "Edited licence payment",
+        old && old.amountInr !== args.amountInr
+          ? `₹${old.amountInr} → ₹${args.amountInr}${tag ? ` — ${tag}` : ""}.`
+          : `Licence payment #${args.id} — details updated${tag ? ` (${tag})` : ""}.`);
+      ctx.invalidateQueries();
+      return { ok: true };
+    },
+  }),
+
+  deleteLicencePayment: defineAction({
+    description: "Deletes a licence payment record permanently.",
+    request: z.object({ ...tokenReq, id: z.number().int().positive() }),
+    response: z.object({ ok: z.literal(true) }),
+    async handler(ctx, args): Promise<{ ok: true }> {
+      await requireSession(ctx, args.token);
+      const db = ctx.db<typeof schema>();
+      const payRow = await db.select().from(schema.licencePayments).where(eq(schema.licencePayments.id, args.id)).limit(1);
+      await db.delete(schema.licencePayments).where(eq(schema.licencePayments.id, args.id));
       const tag = payRow[0] ? await shopTag(ctx, payRow[0].shopId) : null;
-      await logActivity(ctx, "Deleted payment", `${payRow[0] ? `₹${payRow[0].amountInr} (${payRow[0].status})` : `Payment #${args.id}`}${tag ? ` — ${tag}` : ""}.`);
+      await logActivity(ctx, "Deleted licence payment", `${payRow[0] ? `₹${payRow[0].amountInr}` : `Licence payment #${args.id}`}${tag ? ` — ${tag}` : ""}.`);
       ctx.invalidateQueries();
       return { ok: true };
     },
